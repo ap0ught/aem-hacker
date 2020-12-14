@@ -53,7 +53,7 @@ def http_request(url, method='GET', data=None, additional_headers=None, proxy=No
 
     if not proxy:
         proxy = {}
-
+    print(url)
     resp = requests.request(method, url, data=data, headers=headers, proxies=proxy, verify=False, timeout=15, allow_redirects=False)
 
     return resp
