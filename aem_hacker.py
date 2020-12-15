@@ -21,16 +21,11 @@ requests.packages.urllib3.disable_warnings()
 
 
 CREDS = ('admin:admin',
+         'admin:password',
          'author:author',
          'grios:password',
          'replication-receiver:replication-receiver',
-         'vgnadmin:vgnadmin',
-         'aparker@geometrixx.info:aparker',
-         'jdoe@geometrixx.info:jdoe',
-         'james.devore@spambob.com:password',
-         'matt.monroe@mailinator.com:password',
-         'aaron.mcdonald@mailinator.com:password',
-         'jason.werner@dodgit.com:password')
+         'vgnadmin:vgnadmin')
 
 
 def random_string(length=10):
@@ -466,7 +461,7 @@ def exposed_post_servlet(base_url, my_host, debug=False, proxy=None):
 
 @register('create_new_nodes')
 def create_new_nodes(base_url, my_host, debug=False, proxy=None):
-    CREDS = ('admin:admin', 'author:author')
+    CREDS = ('admin:admin', 'author:author', 'admin:password')
 
     nodename1 = random_string()
     r1 = random_string(3)
@@ -530,7 +525,7 @@ def create_new_nodes(base_url, my_host, debug=False, proxy=None):
 
 @register('create_new_nodes2')
 def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
-    CREDS = ('author:author', 'grios:password', 'aparker@geometrixx.info:aparker', 'jdoe@geometrixx.info:jdoe',
+    CREDS = ('admin:admin', 'author:author', 'admin:password', 'grios:password', 'aparker@geometrixx.info:aparker', 'jdoe@geometrixx.info:jdoe',
              'james.devore@spambob.com:password', 'matt.monroe@mailinator.com:password',
              'aaron.mcdonald@mailinator.com:password', 'jason.werner@dodgit.com:password')
 
