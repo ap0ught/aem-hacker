@@ -119,7 +119,7 @@ def error(message, **kwargs):
 def http_request(url, method='GET', data=None, additional_headers=None, proxy=None, debug=False):
 
     with requests.Session() as session:
-        headers = {'User-Agent': 'curl/7.30.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36'}
         if additional_headers:
             headers.update(additional_headers)
         if extra_headers:
@@ -139,7 +139,7 @@ def http_request(url, method='GET', data=None, additional_headers=None, proxy=No
             print('>> Sending {} {}'.format(method, url))
 
         time.sleep(request_delay)
-        session.get(url, verify=False, timeout=40, allow_redirects=False)
+        session.get(url, verify=False, timeout=40, allow_redirects=False,  headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36'})
         time.sleep(request_delay)
         if method == 'GET':
             resp = session.get(url, data=data, headers=headers, proxies=proxy, verify=False, timeout=40, allow_redirects=False)
@@ -155,7 +155,7 @@ def http_request(url, method='GET', data=None, additional_headers=None, proxy=No
 
 
 def http_request_multipart(url, method='POST', data=None, additional_headers=None, proxy=None, debug=False):
-    headers = {'User-Agent': 'curl/7.30.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36'}
     if additional_headers:
         headers.update(additional_headers)
     if extra_headers:
