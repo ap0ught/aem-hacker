@@ -40,6 +40,7 @@ token = random_string()  # Token to recognize SSRF was triggered
 d = {}  # store SSRF detections
 extra_headers = {}
 
+request_delay = 2
 
 class Detector(BaseHTTPRequestHandler):
     def __init__(self, token, d, *args):
@@ -137,7 +138,9 @@ def http_request(url, method='GET', data=None, additional_headers=None, proxy=No
         if debug:
             print('>> Sending {} {}'.format(method, url))
 
+        time.sleep(request_delay)
         session.get(url, verify=False, timeout=40, allow_redirects=False)
+        time.sleep(request_delay)
         if method == 'GET':
             resp = session.get(url, data=data, headers=headers, proxies=proxy, verify=False, timeout=40, allow_redirects=False)
         elif method == 'POST':
@@ -170,6 +173,7 @@ def http_request_multipart(url, method='POST', data=None, additional_headers=Non
     if debug:
         print('>> Sending {} {}'.format(method, url))
 
+    time.sleep(request_delay)
     resp = requests.request(method, url, files=data, headers=headers, proxies=proxy, verify=False, timeout=40, allow_redirects=False)
 
     if debug:
@@ -1594,6 +1598,7 @@ def parse_args():
     parser.add_argument('-H', '--header', nargs='*', help='extra http headers to attach')
     parser.add_argument('--handler', action='append', help='run specific handlers, if omitted run all handlers')
     parser.add_argument('--listhandlers', action='store_true', help='list available handlers')
+    parser.add_argument('--delay', type=int, default=2, help='seconds between requests')
 
     return parser.parse_args(sys.argv[1:])
 
@@ -1613,8 +1618,11 @@ def run_detector(port):  # Run SSRF detector in separate thread
 
 def main():
     global extra_headers
+    global request_delay
 
     args = parse_args()
+
+    request_delay = args.delay
 
     if args.listhandlers:
         print('[*] Available handlers: {0}'.format(list(registered.keys())))
