@@ -1598,7 +1598,7 @@ def parse_args():
     parser.add_argument('-H', '--header', nargs='*', help='extra http headers to attach')
     parser.add_argument('--handler', action='append', help='run specific handlers, if omitted run all handlers')
     parser.add_argument('--listhandlers', action='store_true', help='list available handlers')
-    parser.add_argument('--delay', type=int, default=2, help='seconds between requests')
+    parser.add_argument('--delay', type=float, default=0, help='seconds between requests')
 
     return parser.parse_args(sys.argv[1:])
 
