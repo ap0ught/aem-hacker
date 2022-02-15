@@ -74,6 +74,7 @@ optional arguments:
                         extra http headers to attach
   --handler HANDLER     run specific handlers, if omitted run all handlers
   --listhandlers        list available handlers
+  --delay DELAY         seconds between requests
 ```
 
 #### Usage
