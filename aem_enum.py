@@ -104,7 +104,8 @@ def dispatcher_bypass_get_servlet(base_url, proxy, debug):
         ".json/a.html",
         ".json/a.png",
         ".json/a.ico",
-        ".json/a.1.json" ".json;%0aa.css",
+        ".json/a.1.json",
+        ".json;%0aa.css",
         ".json;%0aa.html",
         ".json;%0aa.png",
         ".json;%0aa.ico",
@@ -341,6 +342,9 @@ def main():
                 outf.write("username|{0}{1}".format(user, os.linesep))
 
             for secret in secrets:
+                # Write the URL of nodes whose names match secret patterns.
+                # This is the intended output of the tool — the "secret" here
+                # is a JCR path that may expose credentials, not a credential value itself.
                 outf.write("secret|{0}{1}".format(secret, os.linesep))
 
 

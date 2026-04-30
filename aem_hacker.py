@@ -2627,7 +2627,7 @@ def main():
     if args.header:
         for header in args.header:
             # Split on the first colon only so header values containing ':'
-            # (e.g. Authorization: Bearer http://...) are preserved intact.
+            # (e.g. X-Custom-Header: key:value:data) are preserved intact.
             header_data = header.split(":", 1)
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:

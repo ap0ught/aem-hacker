@@ -679,7 +679,7 @@ def main():
     semaphore = Semaphore(args.workers)
 
     with concurrent.futures.ThreadPoolExecutor(args.workers) as tpe, open(
-        args.file, "r"
+        args.file, "r", encoding="utf-8"
     ) as input_file:
         while True:
             line = input_file.readline()
