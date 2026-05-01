@@ -2647,7 +2647,7 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
 
     for path in PRODUCTINFO:
         url = normalize_url(base_url, path)
-        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}  # admin:admin
+        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}
         try:
             resp = http_request(
                 url, additional_headers=headers, proxy=proxy, debug=debug
@@ -2687,14 +2687,20 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
     'resource' query parameter.  Affected versions: AEM 6.5.16.0 and earlier.
     Reference: https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html
     """
-    # Use a safe, non-routable domain name as the canary – we never actually contact it
-    CANARY = "evil.example.com"
+    # Use a safe, non-routable domain name as the redirect target – we never actually contact it
+    REDIRECT_TEST_DOMAIN = "evil.example.com"
 
     REDIRECT_PATHS = (
-        "/libs/cq/core/content/login.html?resource=https://{0}".format(CANARY),
-        "/libs/granite/core/content/login.html?resource=https://{0}".format(CANARY),
-        "/libs/cq/core/content/login.html?resource=//{0}".format(CANARY),
-        "/libs/granite/core/content/login.html?resource=//{0}".format(CANARY),
+        "/libs/cq/core/content/login.html?resource=https://{0}".format(
+            REDIRECT_TEST_DOMAIN
+        ),
+        "/libs/granite/core/content/login.html?resource=https://{0}".format(
+            REDIRECT_TEST_DOMAIN
+        ),
+        "/libs/cq/core/content/login.html?resource=//{0}".format(REDIRECT_TEST_DOMAIN),
+        "/libs/granite/core/content/login.html?resource=//{0}".format(
+            REDIRECT_TEST_DOMAIN
+        ),
     )
 
     results = []
@@ -2705,7 +2711,10 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
             resp = http_request(url, proxy=proxy, debug=debug)
 
             location = resp.headers.get("Location", "")
-            if resp.status_code in [301, 302, 303, 307, 308] and CANARY in location:
+            if (
+                resp.status_code in [301, 302, 303, 307, 308]
+                and REDIRECT_TEST_DOMAIN in location
+            ):
                 f = Finding(
                     "OpenRedirect",
                     url,

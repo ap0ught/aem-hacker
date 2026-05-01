@@ -47,9 +47,10 @@ engineers can quickly locate and extend the code.
 
 ## ❌ Known AEM CVEs / Checks NOT Yet Implemented
 
-The following items from the [original tracking issue](../../issues) are not yet covered.
-PRs are welcome — use the [CVE test-reproduction issue template](.github/ISSUE_TEMPLATE/cve-test-reproduction.yml)
-to document your reproduction before sending a PR.
+The following items from the project issue tracker are not yet covered.
+PRs are welcome — use the CVE test-reproduction issue template at
+`.github/ISSUE_TEMPLATE/cve-test-reproduction.yml` to document your reproduction
+before sending a PR.
 
 ### Authentication Bypass / Access Control
 
