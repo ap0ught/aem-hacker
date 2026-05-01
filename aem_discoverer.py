@@ -75,7 +75,6 @@ def http_request(url, method="GET", data=None, additional_headers=None, proxy=No
 
     if not proxy:
         proxy = {}
-    print(url)
     resp = requests.request(
         method,
         url,

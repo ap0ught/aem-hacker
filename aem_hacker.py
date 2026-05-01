@@ -1488,7 +1488,7 @@ def exposed_reports(base_url, my_host, debug=False, proxy=None):
 
             if resp.status_code == 200 and ("Disk Usage" in str(resp.content)):
 
-                f = Finding("Disk Usage report", url, "Disk Usage report are exposed.")
+                f = Finding("Disk Usage report", url, "Disk Usage report is exposed.")
 
                 results.append(f)
                 break
@@ -1719,7 +1719,7 @@ def ssrf_reportingservices_servlet(base_url, my_host, debug=False, proxy=None):
         f = Finding(
             "ReportingServicesServlet",
             u,
-            "SSRF via SalesforceSecretServlet (CVE-2018-12809) was detected. "
+            "SSRF via ReportingServicesServlet (CVE-2018-12809) was detected. "
             "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
         )
 
@@ -2149,7 +2149,7 @@ def ssrf_opensocial_makeRequest(base_url, my_host, debug=False, proxy=None):
         f = Finding(
             "Opensocial (shindig) makeRequest",
             u,
-            "SSRF via Opensocial (shindig) makeRequest. Yon can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
+            "SSRF via Opensocial (shindig) makeRequest. You can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
         )
 
         results.append(f)
@@ -2304,7 +2304,7 @@ def exposed_webdav(base_url, my_host, debug=False, proxy=None):
                 f = Finding(
                     "WebDAV exposed",
                     url,
-                    "WebDAV might we vulnerable to CVE-2015-1833. Check it manually. "
+                    "WebDAV might be vulnerable to CVE-2015-1833. Check it manually. "
                     "See - http://mail-archives.apache.org/mod_mbox/jackrabbit-announce/201505.mbox/raw/%3C555DA644.8080908@greenbytes.de%3E/3",
                 )
 
@@ -2629,6 +2629,13 @@ def main():
             # Split on the first colon only so header values containing ':'
             # (e.g. X-Custom-Header: key:value:data) are preserved intact.
             header_data = header.split(":", 1)
+            if len(header_data) != 2 or not header_data[0].strip():
+                print(
+                    "Malformed header '{0}'. Expected format: 'Name: Value'.".format(
+                        header
+                    )
+                )
+                sys.exit(1337)
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:
         extra_headers = {}

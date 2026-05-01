@@ -5,11 +5,12 @@ RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /aem-hacker
 
-# Copy local source so the image uses the code from this repository
-# rather than a potentially stale remote clone.
-COPY . .
-
+# Install dependencies first (better layer caching).
+COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
+
+# Copy application source.  .dockerignore excludes .git, caches, venvs, etc.
+COPY . .
 
 ENTRYPOINT [ "/bin/bash" ]
 

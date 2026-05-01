@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 AEM Enum - Enumerates users and secrets from an exposed AEM JCR repository.
 
@@ -157,7 +158,7 @@ def process_node_get_servlet(
         "*[Cc]onfig*.zip",
         "*[Bb]ackup*.zip",
         "*[Ss]ql*.zip",
-    )  # Add more patters for secrets
+    )  # Add more patterns for secrets
 
     users = set()
     secrets = set()
@@ -334,7 +335,7 @@ def main():
         tpe.shutdown(wait=True)
 
         with open(
-            args.out, "w"
+            args.out, "w", encoding="utf-8"
         ) as outf:  # Write results to a CSV file using | symbol as delimiter
             outf.write("Type|Value" + os.linesep)
 
