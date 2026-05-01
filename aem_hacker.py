@@ -40,6 +40,7 @@ References:
 import concurrent.futures
 import itertools
 import json
+import re
 import datetime
 import traceback
 import sys
@@ -2612,22 +2613,23 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
                 resp.content
             ):
                 body = str(resp.content)
-                has_version = any(
-                    token in body
-                    for token in [
-                        "6.0",
-                        "6.1",
-                        "6.2",
-                        "6.3",
-                        "6.4",
-                        "6.5",
-                        "2023",
-                        "2024",
-                        "2025",
-                        "Cloud Service",
-                    ]
+                # Look for specific AEM/CQ version markers rather than bare year
+                # numbers which can appear in copyright footers and cause false positives.
+                # Patterns matched:
+                #   "6.x.y.z" next to "AEM" or "CQ"  – on-premise release trains
+                #   "AEM as a Cloud Service"           – cloud indicator
+                #   data-granite-version="..."         – Granite UI version attribute
+                #   "Build" followed by a dotted number (e.g. "Build 6.5.12.0")
+                AEM_VERSION_RE = re.compile(
+                    r"(?:"
+                    r"(?:AEM|CQ)\s+\d+\.\d+"  # "AEM 6.5" / "CQ 6.4"
+                    r"|AEM\s+as\s+a\s+Cloud\s+Service"
+                    r"|data-granite-version=[\"']\d"
+                    r"|Build\s+\d+\.\d+\.\d+"
+                    r")",
+                    re.IGNORECASE,
                 )
-                if has_version:
+                if AEM_VERSION_RE.search(body):
                     f = Finding(
                         "AEM Version Disclosure",
                         url,
@@ -2711,19 +2713,23 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
             resp = http_request(url, proxy=proxy, debug=debug)
 
             location = resp.headers.get("Location", "")
-            if (
-                resp.status_code in [301, 302, 303, 307, 308]
-                and REDIRECT_TEST_DOMAIN in location
-            ):
-                f = Finding(
-                    "OpenRedirect",
-                    url,
-                    "Open redirect (CVE-2023-29297) detected. "
-                    "The login page redirects to an external domain via the 'resource' parameter. "
-                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html",
-                )
-                results.append(f)
-                break
+            # Only flag when Location is an absolute URL (https?:// or //) whose
+            # *authority/host* component is exactly the test domain – not when the
+            # domain appears only in a query-string parameter like
+            # /system/sling/login?resource=https%3A%2F%2Fevil.example.com
+            if resp.status_code in [301, 302, 303, 307, 308]:
+                # Match http(s)://host or //host at the start of the Location value
+                m = re.match(r"^(?:https?:)?//([^/?#]+)", location, re.IGNORECASE)
+                if m and m.group(1).lower() == REDIRECT_TEST_DOMAIN:
+                    f = Finding(
+                        "OpenRedirect",
+                        url,
+                        "Open redirect (CVE-2023-29297) detected. "
+                        "The login page redirects to an external domain via the 'resource' parameter. "
+                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html",
+                    )
+                    results.append(f)
+                    break
         except Exception:
             if debug:
                 error(
@@ -2963,17 +2969,6 @@ def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
     global token, d
 
     r = random_string(3)
-
-    # Proxy-like servlets identified in AEM that may have been patched in APSB21-99
-    SSRF_PATHS1 = itertools.product(
-        (
-            "/libs/granite/ui/components/foundation/clientlibs/foundation/javascript/granite/csrf.json",
-            "/libs/cq/contentsync/content/replication{0}",
-            "///libs///cq///contentsync///content///replication{0}",
-        ),
-        (".json", ".1.json", ".html"),
-    )
-    SSRF_PATHS1 = list(pair[0].format(pair[1]) for pair in SSRF_PATHS1)
 
     SSRF_PATHS2 = itertools.product(
         (
