@@ -1,9 +1,16 @@
-FROM python:3
+FROM python:3.12-slim
 
-RUN apt update && apt upgrade -y
-RUN git clone https://github.com/0ang3el/aem-hacker.git
+# Install OS updates to pick up any security fixes in the base image.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /aem-hacker
-RUN python -m pip install -r requirements.txt
+
+# Install dependencies first (better layer caching).
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+# Copy application source.  .dockerignore excludes .git, caches, venvs, etc.
+COPY . .
 
 ENTRYPOINT [ "/bin/bash" ]
 

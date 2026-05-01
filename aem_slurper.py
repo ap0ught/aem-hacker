@@ -9,6 +9,7 @@ Usage:
 """
 
 import os
+
 if os.name == "nt":
     # Check if executing the Windows build of Python from a Cygwin shell.
     if "TZ" in os.environ:
@@ -28,8 +29,10 @@ import ssl
 
 class Usage(SystemExit):
     def __init__(self, complaint=None):
-        super(Usage, self).__init__(__doc__.format(script=os.path.basename(__file__))
-                + ("" if complaint is None else "\nERROR: %s\n" % (complaint,)) )
+        super(Usage, self).__init__(
+            __doc__.format(script=os.path.basename(__file__))
+            + ("" if complaint is None else "\nERROR: %s\n" % (complaint,))
+        )
 
 
 def to_s_since_epoch(tsz=None):
@@ -78,7 +81,7 @@ def local_timestamp(s_since_epoch=None):
     else:
         utcsign = "-"
         utcoff = -utcoff
-    strtime += ("%s%02d%02d" % (utcsign, utcoff // 3600, (utcoff % 3600) // 60))
+    strtime += "%s%02d%02d" % (utcsign, utcoff // 3600, (utcoff % 3600) // 60)
     return strtime
 
 
@@ -88,7 +91,9 @@ def slurp(conn, site, uri):
         r = conn.getresponse()
     except (http.client.RemoteDisconnected, http.client.ResponseNotReady):
         print(f"Reconnecting to {site}...", flush=True)
-        conn = http.client.HTTPSConnection(site, context=ssl._create_unverified_context())
+        conn = http.client.HTTPSConnection(
+            site, context=ssl._create_unverified_context()
+        )
         conn.request("GET", uri)
         r = conn.getresponse()
     # print(r.status, r.reason, flush=True)
@@ -133,11 +138,12 @@ def start_dig(site, path=None):
                     elif pt == "cq:PageContent":
                         htmluri = uri
                         if htmluri.endswith("/jcr:content"):
-                            htmluri = htmluri[:-len("/jcr:content")] + ".html"
+                            htmluri = htmluri[: -len("/jcr:content")] + ".html"
                         html, conn = slurp(conn, site, htmluri)
                         child["FETCHED_HTML"] = html
                     print(tsstr, uri, created_by, json.dumps(child), flush=True)
                     visited[uri] = (tsstr, created_by)
+
     dig(path)
 
 
@@ -152,5 +158,5 @@ def main(site=None, *args):
 
 if __name__ == "__main__":
     import sys
-    main(*sys.argv[1:])
 
+    main(*sys.argv[1:])
