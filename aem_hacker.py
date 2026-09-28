@@ -130,21 +130,40 @@ def parse_credential(value):
     an HTTP header, and a credential that can terminate the header would let a
     caller inject arbitrary request headers or split the request.
     """
+    # Nothing below interpolates `value` or `password` into a message: this string
+    # is a secret, and it can reach a terminal scrollback or a CI log.
     if not isinstance(value, str) or ":" not in value:
         raise CredentialError(
-            "Credentials must be in 'user:password' form, got {0!r}.".format(value)
+            "Credentials must be in 'user:password' form (the value given has no "
+            "':' and is {0} characters long).".format(
+                len(value) if isinstance(value, str) else "non-string"
+            )
         )
 
     user, password = value.split(":", 1)
 
     if not user:
-        raise CredentialError("Credential has an empty username: {0!r}".format(value))
+        raise CredentialError(
+            "Credential has an empty username; the password is {0} characters "
+            "long.".format(len(password))
+        )
 
     for field, name in ((user, "username"), (password, "password")):
         if any(ch in field for ch in "\r\n\x00"):
             raise CredentialError(
                 "Credential {0} must not contain CR, LF or NUL characters.".format(name)
             )
+
+    try:
+        # RFC 7617 decodes Basic credentials as ISO-8859-1, and Tomcat does the
+        # same. Encoding as UTF-8 would send a non-ASCII password as mojibake
+        # that silently never validates.
+        "{0}:{1}".format(user, password).encode("latin-1")
+    except UnicodeEncodeError:
+        raise CredentialError(
+            "Credential contains characters outside ISO-8859-1, which HTTP Basic "
+            "authentication cannot transmit."
+        ) from None
 
     return user, password
 
@@ -173,8 +192,13 @@ def basic_auth_header(creds):
     if isinstance(creds, str):
         creds = parse_credential(creds)
     user, password = creds
-    token = base64.b64encode("{0}:{1}".format(user, password).encode()).decode()
-    return {"Authorization": "Basic {0}".format(token)}
+    # Named `encoded`, not `token`: `token` is the module-level SSRF
+    # correlation token, and a local of the same name is one edit away from
+    # clobbering it.
+    encoded = base64.b64encode(
+        "{0}:{1}".format(user, password).encode("latin-1")
+    ).decode("ascii")
+    return {"Authorization": "Basic {0}".format(encoded)}
 
 
 def credentials_to_probe():
@@ -184,7 +208,10 @@ def credentials_to_probe():
     default-credential list so today's behaviour is unchanged when the flag is
     not used.  Duplicates are removed and the order preserved.
     """
-    pairs = list(credentials) if credentials else [parse_credential(c) for c in CREDS]
+    # Supplied credentials are *added to* the built-in list, not substituted for
+    # it: reaching a PR:L check with --creds must not silently disable
+    # "AEM with default credentials" detection.
+    pairs = [parse_credential(c) for c in CREDS] + list(credentials)
     seen = set()
     out = []
     for pair in pairs:
@@ -200,6 +227,14 @@ class Detector(BaseHTTPRequestHandler):
     Requests must match the path pattern /<token>/<key>/<value>/ so that
     each check can identify its own SSRF hit by a unique key.
     """
+
+    # The listener is bound on 0.0.0.0, so anything that can reach it can open a
+    # connection. Without a timeout, a peer that connects and never sends a byte
+    # holds a worker thread and a file descriptor forever.
+    timeout = 15
+
+    # Cap what one key can accumulate, so a peer cannot grow this without bound.
+    max_values_per_key = 32
 
     def __init__(self, token, d, *args):
         self.d = d
@@ -230,12 +265,9 @@ class Detector(BaseHTTPRequestHandler):
             self.reply()
             return
 
-        if key in self.d:
-            self.d[key].append(value)
-        else:
-            self.d[key] = [
-                value,
-            ]
+        values = self.d.setdefault(key, [])
+        if len(values) < self.max_values_per_key:
+            values.append(value)
 
         self.reply()
 
@@ -277,7 +309,20 @@ def register(name, ssrf=False, experimental=False):
     return decorator
 
 
-IDENTITY_KEYS = ("authorizableId", "userID", "id", "profileId")
+# Keys that name the authenticated principal in a login-status response.
+# "id" is deliberately absent: as a bare substring it matches "identifier",
+# "invalid", id="..." and most error pages, which turned any 200 error body
+# without the word "anonymous" into a bogus "credentials work" finding.
+IDENTITY_KEYS = ("authorizableId", "userID", "userid", "profileId")
+
+# An explicit rejection wins over anything else in the body.
+REJECTED_RE = re.compile(r'"?authenticated"?\s*[:=]\s*"?false', re.IGNORECASE)
+
+# Structural match for non-JSON bodies, so a stray "id" is not enough.
+IDENTITY_RE = re.compile(
+    r"\b(authorizableId|userid|profileid)\b\s*[:=]\s*[\"\']([^\"\'<>\s,&]+)",
+    re.IGNORECASE,
+)
 
 
 def username_of(creds):
@@ -310,6 +355,8 @@ def authenticated_as(resp, creds):
         payload = None
 
     if isinstance(payload, dict):
+        if payload.get("authenticated") is False:
+            return None
         for key in IDENTITY_KEYS:
             principal = payload.get(key)
             if isinstance(principal, str) and principal and principal != "anonymous":
@@ -317,11 +364,11 @@ def authenticated_as(resp, creds):
         return None
 
     body = resp.content.decode(errors="replace")
-    if "anonymous" in body:
+    if REJECTED_RE.search(body) or "anonymous" in body:
         return None
-    for key in IDENTITY_KEYS:
-        if key in body:
-            return username_of(creds)
+    match = IDENTITY_RE.search(body)
+    if match and match.group(2) != "anonymous":
+        return match.group(2)
 
     return None
 
@@ -1176,7 +1223,14 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
         try:
             resp = http_request(url, proxy=proxy, debug=debug)
 
-            if resp.status_code == 200 and "authenticated=" in str(resp.content):
+            # Accept both response shapes: the JSON form
+            # ({"authenticated": true, "userid": ...}) and the form-encoded one
+            # (authenticated=true&userid=...). Matching only "authenticated="
+            # missed the JSON form this servlet returns for a .json selector.
+            body = str(resp.content)
+            if resp.status_code == 200 and (
+                "authenticated=" in body or '"authenticated"' in body
+            ):
                 f = Finding(
                     "LoginStatusServlet",
                     url,
@@ -1233,7 +1287,7 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
 
 @register("currentuser_servlet")
 def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
-    """Check for an exposed CurrentUserServlet and test default credentials against it (disabled by default)."""
+    """Check for an exposed CurrentUserServlet and test credentials against it."""
     global CREDS
 
     r = random_string(3)
@@ -1691,7 +1745,7 @@ def exposed_crxde_crx(base_url, my_host, debug=False, proxy=None):
 
 @register("reports")
 def exposed_reports(base_url, my_host, debug=False, proxy=None):
-    """Check for an exposed Disk Usage report (disabled by default)."""
+    """Check for an exposed Disk Usage report."""
     r = random_string(3)
 
     DISKUSAGE = itertools.product(
@@ -1819,7 +1873,17 @@ def ssrf_salesforcesecret_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "salesforcesecret" in d:
-        u = base64.b16decode(d.get("salesforcesecret")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("salesforcesecret")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'salesforcesecret' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "SalesforceSecretServlet",
             u,
@@ -1935,7 +1999,17 @@ def ssrf_reportingservices_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "reportingservices" in d:
-        u = base64.b16decode(d.get("reportingservices")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("reportingservices")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'reportingservices' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "ReportingServicesServlet",
             u,
@@ -2050,7 +2124,17 @@ def ssrf_sitecatalyst_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "sitecatalyst" in d:
-        u = base64.b16decode(d.get("sitecatalyst")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("sitecatalyst")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'sitecatalyst' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "SiteCatalystServlet",
             u,
@@ -2159,7 +2243,17 @@ def ssrf_autoprovisioning_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "autoprovisioning" in d:
-        u = base64.b16decode(d.get("autoprovisioning")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("autoprovisioning")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'autoprovisioning' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "AutoProvisioningServlet",
             u,
@@ -2256,7 +2350,17 @@ def ssrf_opensocial_proxy(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "opensocial" in d:
-        u = base64.b16decode(d.get("opensocial")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("opensocial")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'opensocial' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "Opensocial (shindig) proxy",
             u,
@@ -2365,7 +2469,17 @@ def ssrf_opensocial_makeRequest(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "opensocialmakerequest" in d:
-        u = base64.b16decode(d.get("opensocialmakerequest")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("opensocialmakerequest")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'opensocialmakerequest' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "Opensocial (shindig) makeRequest",
             u,
@@ -3264,7 +3378,17 @@ def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "cve202140722" in d:
-        u = base64.b16decode(d.get("cve202140722")[0]).decode()
+        try:
+            u = base64.b16decode(d.get("cve202140722")[0]).decode()
+        except Exception:
+            # A callback arrived but could not be decoded (percent-encoding, a query
+            # string, truncation). The SSRF happened; we just cannot name the URL.
+            print(
+                "[!] Received an unparseable 'cve202140722' SSRF callback; see the "
+                "listener output for the raw path.",
+                file=sys.stderr,
+            )
+            u = "unknown"
         f = Finding(
             "SSRF (unverified CVE attribution)",
             u,
@@ -3516,13 +3640,21 @@ def main():
 
     findings = 0
     failed_checks = 0
+    interrupted = False
     # Findings are streamed as each check finishes, so a long scan shows progress
     # and its results survive a crash or a Ctrl-C partway through.
     try:
         with concurrent.futures.ThreadPoolExecutor(args.workers) as tpe:
             futures = {}
             for name, check in selected:
-                my_host = "{0}:{1}".format(args.host, args.port)
+                # Use the port the listener actually bound. run_detector falls
+                # back to a free port when the requested one is unavailable
+                # (port 80 needs root), and telling the checks the requested port
+                # would point every callback at a dead port -- making all seven
+                # SSRF checks silently return nothing.
+                my_host = "{0}:{1}".format(
+                    args.host, httpd.server_address[1] if httpd else args.port
+                )
                 futures[tpe.submit(check, args.url, my_host, args.debug, proxy)] = name
 
             for future in concurrent.futures.as_completed(futures):
@@ -3551,6 +3683,7 @@ def main():
                         )
                     emit(finding, sink, args.format)
     except KeyboardInterrupt:
+        interrupted = True
         print("\n[!] Interrupted.", file=sys.stderr)
     finally:
         if httpd is not None:
@@ -3567,7 +3700,11 @@ def main():
         file=sys.stderr,
     )
 
-    # Non-zero when something was found, so the tool composes in a pipeline.
+    # 0 = clean, 1 = something was found, 2 = the scan did not complete. A run
+    # whose checks all crashed, or that was interrupted, must never be
+    # indistinguishable from a clean bill of health.
+    if interrupted or failed_checks:
+        return 2
     return 1 if findings else 0
 
 

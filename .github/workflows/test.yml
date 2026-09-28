@@ -25,7 +25,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          # requirements-enum.txt pulls in the core requirements plus dpath, which
+          # only aem_enum.py needs but which tests/test_aem_hacker.py exercises.
+          python -m pip install -r requirements-enum.txt
 
       - name: Compile every script
         # Catches a syntax error in a script the test suite does not import.

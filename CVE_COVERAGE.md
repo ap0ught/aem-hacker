@@ -89,6 +89,9 @@ Properties worth knowing:
 * With no `--creds`, **every check behaves exactly as it did before**: the
   anonymous path is unchanged, and the one check that has always probed a
   credential still does.
+* Supplied credentials are **added to** the built-in default-credential list, not
+  substituted for it — using `--creds` to reach a `PR:L` check does not silently
+  disable "AEM with default credentials" detection.
 * Only the **first** credential is used for session-style probes, so supplying
   several does not multiply the request count. The default-credential checks try
   all of them in place of their built-in list.

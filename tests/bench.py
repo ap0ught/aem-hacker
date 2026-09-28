@@ -5,8 +5,8 @@ Runs a representative subset of checks against a local HTTPS target that
 404s everything, for both the current aem_hacker.py and a git revision of it,
 and reports requests, TCP connections and wall time.
 
-    python3 tests/bench.py            # current tree
-    python3 tests/bench.py HEAD       # compare against a committed revision
+    python3 tests/bench.py            # current tree vs master (the useful default)
+    python3 tests/bench.py HEAD~1     # compare against any other revision
 
 The connection count is the headline number: a new Session per request means a
 fresh TLS handshake per request, which is what dominates a scan of a real AEM.
@@ -129,15 +129,17 @@ def main():
     url = "https://127.0.0.1:{0}".format(port)
 
     variants = [("current", os.path.join(ROOT, "aem_hacker.py"))]
-    if len(sys.argv) > 1:
-        rev = sys.argv[1]
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp:
-            tmp.write(
-                subprocess.check_output(
-                    ["git", "-C", ROOT, "show", "{0}:aem_hacker.py".format(rev)]
-                )
+
+    # Default to master, not HEAD: on a feature branch HEAD is this branch, so
+    # comparing against it measures nothing.
+    rev = sys.argv[1] if len(sys.argv) > 1 else "master"
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp:
+        tmp.write(
+            subprocess.check_output(
+                ["git", "-C", ROOT, "show", "{0}:aem_hacker.py".format(rev)]
             )
-            variants.insert(0, (rev, tmp.name))
+        )
+        variants.insert(0, (rev, tmp.name))
 
     try:
         for label, path in variants:

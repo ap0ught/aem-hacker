@@ -325,6 +325,180 @@ class TestCrashIsolation(unittest.TestCase):
         )
 
 
+class TestLoginSignalCorrectness(unittest.TestCase):
+    """The credential checks must not lose, or invent, a login signal.
+
+    An earlier revision replaced each check's own documented positive signal with
+    one generic helper. That regressed loginstatus_servlet -- LoginStatusServlet
+    reports a lower-case "userid" and an "authenticated" field, neither of which
+    the helper matched -- while the generic non-JSON fallback matched a bare "id"
+    inside almost any 200 error page.
+    """
+
+    def _resp(self, status, body):
+        class R:
+            status_code = status
+            content = body
+
+        return R()
+
+    def test_loginstatus_body_is_recognised(self):
+        body = b'{"authenticated": true, "userid": "admin", "userName": "Admin"}'
+        self.assertEqual(
+            aem_hacker.authenticated_as(self._resp(200, body), ("admin", "admin")),
+            "admin",
+        )
+
+    def test_a_200_error_page_is_not_an_authenticated_principal(self):
+        err = (
+            b'<html><head><title>Error</title></head><body><div id="error">'
+            b"Invalid request identifier</div></body></html>"
+        )
+        self.assertIsNone(
+            aem_hacker.authenticated_as(self._resp(200, err), ("admin", "admin"))
+        )
+
+    def test_an_explicit_rejection_is_never_an_authenticated_principal(self):
+        for body in (b"authenticated=false&userid=", b'{"authenticated": false}'):
+            self.assertIsNone(
+                aem_hacker.authenticated_as(self._resp(200, body), ("admin", "admin")),
+                f"{body!r} was read as a successful login",
+            )
+
+    def test_id_is_not_accepted_as_a_bare_substring(self):
+        """Regression: "id" matched identifier/invalid/id="..." in error pages."""
+        self.assertNotIn("id", aem_hacker.IDENTITY_KEYS)
+
+    def test_loginstatus_check_still_reports_a_working_credential(self):
+        def loginstatus(method, path, headers):
+            auth = headers.get("Authorization", "")
+            if not auth:
+                return b'{"authenticated": false}'
+            import base64
+
+            if base64.b64decode(auth.split(" ", 1)[-1]).decode() == "admin:admin":
+                return b'{"authenticated": true, "userid": "admin"}'
+            return b'{"authenticated": false}'
+
+        with MockAEM(routes=[Route(r".*", body=loginstatus)]) as target:
+            findings = run_handler(aem_hacker.registered["loginstatus_servlet"], target)
+        cred_hits = [
+            f for f in findings if "default credentials" in f.description.lower()
+        ]
+        self.assertEqual(
+            len(cred_hits), 1, "a working default credential was not reported"
+        )
+
+
+class TestExitStatusHonesty(unittest.TestCase):
+    """A scan that did not complete must not look like a clean one."""
+
+    def _run_main(self, registered, argv=None):
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with mock.patch.object(aem_hacker, "registered", registered), mock.patch.object(
+            sys, "argv", ["aem_hacker.py"] + (argv or [])
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), mock.patch.object(
+            aem_hacker, "run_detector", lambda p: mock.Mock()
+        ), mock.patch.object(
+            aem_hacker.time, "sleep", no_sleep
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            try:
+                code = aem_hacker.main() or 0
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, out.getvalue(), err.getvalue()
+
+    def test_crashed_checks_are_not_reported_as_clean(self):
+        def boom(base_url, my_host, debug=False, proxy=None):
+            raise RuntimeError("check exploded")
+
+        code, _, err = self._run_main(
+            {"boom": boom}, ["-u", "http://x", "--host", "127.0.0.1"]
+        )
+        self.assertEqual(
+            code, 2, "a run whose only check crashed exited as if it were clean"
+        )
+        self.assertIn("1 check(s) failed", err)
+
+    def test_a_finding_still_exits_one(self):
+        def good(base_url, my_host, debug=False, proxy=None):
+            return [aem_hacker.Finding("Good", base_url, "found")]
+
+        code, _, _ = self._run_main(
+            {"good": good}, ["-u", "http://x", "--host", "127.0.0.1"]
+        )
+        self.assertEqual(code, 1)
+
+    def test_a_clean_scan_exits_zero(self):
+        def clean(base_url, my_host, debug=False, proxy=None):
+            return []
+
+        code, _, _ = self._run_main(
+            {"clean": clean}, ["-u", "http://x", "--host", "127.0.0.1"]
+        )
+        self.assertEqual(code, 0)
+
+
+class TestSsrfCallbackPort(unittest.TestCase):
+    """The checks must be told the port the listener actually bound.
+
+    run_detector() falls back to a free port when --port is unavailable (the
+    default, 80, needs root), so a non-root run always took that path. The checks
+    were still told the requested port, which pointed every callback at a dead
+    port and made all seven SSRF checks silently return nothing.
+    """
+
+    def test_checks_receive_the_bound_port(self):
+        captured = []
+
+        def needs_host(base_url, my_host, debug=False, proxy=None):
+            captured.append(my_host)
+            return []
+
+        needs_host.ssrf = True
+        # Port 1 is privileged, so run_detector will fall back to a free port.
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            aem_hacker, "registered", {"needs_host": needs_host}
+        ), mock.patch.object(
+            sys,
+            "argv",
+            [
+                "aem_hacker.py",
+                "-u",
+                "http://127.0.0.1:1",
+                "--host",
+                "1.2.3.4",
+                "--port",
+                "1",
+            ],
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), mock.patch.object(
+            aem_hacker.time, "sleep", no_sleep
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            try:
+                aem_hacker.main()
+            except SystemExit:
+                pass
+        self.assertEqual(len(captured), 1, "the SSRF check did not run")
+        port = int(captured[0].rsplit(":", 1)[1])
+        self.assertNotEqual(
+            port, 1, "the check was told the unavailable port, not the bound one"
+        )
+
+
 class TestDefaultCredentialsFalsePositive(unittest.TestCase):
     """A rejected login must never be reported as 'default credentials work'."""
 
@@ -633,15 +807,27 @@ class TestCredentialsFlag(unittest.TestCase):
         self.assertEqual(pairs[0], ("admin", "admin"))
         self.assertIn(("author", "author"), pairs)
 
-    def test_supplied_creds_replace_the_builtin_list(self):
+    def test_supplied_creds_extend_the_builtin_list(self):
+        """--creds must ADD to the default list, not replace it.
+
+        Substituting instead would mean that reaching a PR:L check with --creds
+        silently disabled "AEM with default credentials" detection.
+        """
         with scanner(credentials=[("bob", self.SECRET)]):
             pairs = aem_hacker.credentials_to_probe()
-        self.assertEqual(pairs, [("bob", self.SECRET)])
+        self.assertIn(("bob", self.SECRET), pairs)
+        self.assertIn(("admin", "admin"), pairs, "the built-in list was dropped")
+        self.assertEqual(
+            pairs[0], ("admin", "admin"), "the built-in order should come first"
+        )
 
     def test_duplicate_creds_are_collapsed(self):
         with scanner(credentials=[("bob", "a"), ("bob", "a"), ("eve", "b")]):
             pairs = aem_hacker.credentials_to_probe()
-        self.assertEqual(pairs, [("bob", "a"), ("eve", "b")])
+        self.assertEqual(len(pairs), len(set(pairs)), "duplicates survived")
+        for pair in (("bob", "a"), ("eve", "b")):
+            self.assertIn(pair, pairs)
+            self.assertEqual(pairs.count(pair), 1, f"{pair} appears more than once")
 
     def test_primary_auth_header_is_empty_when_anonymous(self):
         with scanner(credentials=[]):
@@ -702,6 +888,9 @@ class TestCredentialsFlag(unittest.TestCase):
                 ):
                     seen.clear()
                     run_handler(aem_hacker.registered[name], target)
+                    # assert before the all(): all([]) is True, so without this a
+                    # check that stopped requesting anything would pass.
+                    self.assertTrue(seen, f"{name} sent no requests at all")
                     self.assertTrue(
                         all(a is None for a in seen),
                         f"{name} authenticated itself with no --creds given",
@@ -738,33 +927,74 @@ class TestCredentialsFlag(unittest.TestCase):
         )
         self.assertIn("bob", report, "the username should still be reported")
 
+    def test_every_rejection_path_hides_the_password(self):
+        """Every way --creds can fail must not print the secret.
+
+        The CR/LF branch never echoed the value, so a test covering only that one
+        was self-fulfilling: the malformed-form and empty-username branches used
+        to include the whole value, password and all.
+        """
+        bad_values = [
+            "user:" + self.SECRET + "\r\nX-Injected: 1",  # CR/LF
+            ":" + self.SECRET,  # empty username
+            self.SECRET,  # no colon
+            "user:" + self.SECRET + "\x00",  # NUL
+        ]
+        for value in bad_values:
+            with self.assertRaises(aem_hacker.CredentialError, msg=value):
+                aem_hacker.parse_credential(value)
+            try:
+                aem_hacker.parse_credential(value)
+            except aem_hacker.CredentialError as exc:
+                self.assertNotIn(
+                    self.SECRET,
+                    str(exc),
+                    "the password leaked for {0!r}: {1}".format(value, exc),
+                )
+
+    def test_rejects_characters_basic_auth_cannot_transmit(self):
+        """RFC 7617 is ISO-8859-1; UTF-8 would send mojibake that never validates."""
+        with self.assertRaises(aem_hacker.CredentialError):
+            aem_hacker.parse_credential("bob:\U0001f600")
+        # ...but a Latin-1 representable password round-trips.
+        import base64
+
+        user, password = aem_hacker.parse_credential("bob:päss")
+        header = aem_hacker.basic_auth_header((user, password))["Authorization"]
+        self.assertEqual(base64.b64decode(header[6:]).decode("latin-1"), "bob:päss")
+
     def test_malformed_creds_exit_nonzero_without_echoing_the_value(self):
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(
-            sys,
-            "argv",
-            [
-                "aem_hacker.py",
-                "-u",
-                "http://x",
-                "--host",
-                "1.2.3.4",
-                "--creds",
-                "user:{}".format(self.SECRET) + "\r\nX-Injected: 1",
-            ],
-        ), mock.patch.object(
-            aem_hacker, "preflight", lambda *a, **k: True
-        ), mock.patch.object(
-            aem_hacker, "run_detector", lambda p: mock.Mock()
-        ), contextlib.redirect_stdout(
-            out
-        ), contextlib.redirect_stderr(
-            err
+        for bad in (
+            "user:" + self.SECRET + "\r\nX-Injected: 1",
+            ":" + self.SECRET,
+            self.SECRET,
         ):
-            with self.assertRaises(SystemExit) as ctx:
-                aem_hacker.main()
-        self.assertNotEqual(ctx.exception.code, 0)
-        self.assertNotIn(self.SECRET, out.getvalue() + err.getvalue())
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "aem_hacker.py",
+                    "-u",
+                    "http://x",
+                    "--host",
+                    "1.2.3.4",
+                    "--creds",
+                    bad,
+                ],
+            ), mock.patch.object(
+                aem_hacker, "preflight", lambda *a, **k: True
+            ), mock.patch.object(
+                aem_hacker, "run_detector", lambda p: mock.Mock()
+            ), contextlib.redirect_stdout(
+                out
+            ), contextlib.redirect_stderr(
+                err
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    aem_hacker.main()
+            self.assertNotEqual(ctx.exception.code, 0)
+            self.assertNotIn(self.SECRET, out.getvalue() + err.getvalue())
 
 
 class TestCveCoverageDoc(unittest.TestCase):

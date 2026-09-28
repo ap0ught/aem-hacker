@@ -134,7 +134,7 @@ def slurp(conn, site, uri):
                     # Not JSON despite the content type; hand back the raw body
                     # and let the caller notice the shape mismatch.
                     data = data.decode("utf-8", "replace")
-        elif ct.split("/")[0] == "text":
+        elif ct.split("/")[0] == "text" if "/" in ct else False:
             data = data.decode("utf-8", "replace")
     return data, conn, r.status
 
@@ -214,8 +214,10 @@ def main(site=None, *args):
     path = None
     if len(args) > 0:
         path = args[0]
-    start_dig(site, path)
+    return start_dig(site, path)
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    # A crawl that could not read some nodes is not a clean result, so say so in
+    # the exit status rather than only on stderr.
+    sys.exit(1 if main(*sys.argv[1:]) else 0)

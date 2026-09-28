@@ -85,8 +85,18 @@ optional arguments:
   --strict              skip checks marked experimental (see below)
   --output OUTPUT       write the report to a file instead of stdout
 
-Findings are printed as each check finishes, and the exit status is 1 when
-anything was found, so the tool composes in a pipeline:
+Findings are printed as each check finishes, and the exit status is meaningful so
+the tool composes in a pipeline:
+
+| Exit | Meaning |
+|---|---|
+| `0` | clean — every selected check ran and found nothing |
+| `1` | something was found |
+| `2` | the scan did **not** complete: a check crashed, or it was interrupted |
+
+Exit `2` exists so a failed or truncated scan is never mistaken for a clean bill
+of health:
+
 
 ```
 aem_hacker.py -u https://aem.webapp --format json --output findings.json || echo "something was found"
