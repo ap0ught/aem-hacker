@@ -58,7 +58,7 @@ usage: aem_hacker.py [-h] [-u URL] [--proxy PROXY] [--debug] [--host HOST]
                      [--port PORT] [--workers WORKERS]
                      [-H [HEADER [HEADER ...]]] [--handler HANDLER]
                      [--listhandlers] [--delay DELAY] [--ssrf-timeout SSRF_TIMEOUT]
-                     [--format {text,json}] [--output OUTPUT]
+                     [--creds USER:PASS] [--format {text,json}] [--output OUTPUT]
 
 AEM hacker by @0ang3el, see the slides -
 https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps
@@ -79,6 +79,8 @@ optional arguments:
   --delay DELAY         seconds between requests
   --ssrf-timeout SSRF_TIMEOUT
                         seconds to wait for SSRF callbacks to arrive
+  --creds USER:PASS     credential for checks that need an authenticated
+                        session; repeatable
   --format {text,json}  output format; 'json' is one finding per line
   --strict              skip checks marked experimental (see below)
   --output OUTPUT       write the report to a file instead of stdout
@@ -92,6 +94,22 @@ aem_hacker.py -u https://aem.webapp --format json --output findings.json || echo
 
 (The usage block above is abridged for readability — `aem_hacker.py -h` is
 authoritative.)
+
+**Authenticated checks (`--creds`).** Most AEM CVEs are low-privilege or
+require user interaction, so an anonymous scanner structurally cannot detect
+them — APSB22-59 alone lists ~35 such issues. Pass a credential and the checks
+that Adobe rates `PR:L` (the AEM Forms/TouchUI XSS checks, the login-page open
+redirect) and the authenticated product-info probe will send it:
+
+```
+python3 aem_hacker.py -u https://aem.webapp --host your_vps --creds author:author
+```
+
+The password is never written to a finding, to stdout, or to an error message.
+With no `--creds` every check behaves exactly as before. Only the first
+credential is used for session-style probes, so supplying more does not multiply
+the request count; the default-credential checks try all of them in place of
+their built-in list.
 
 **Experimental checks.** Five of the checks carry CVE numbers that an audit
 found to be wrong: CVE-2023-38205 is an Adobe *ColdFusion* issue, CVE-2021-40722

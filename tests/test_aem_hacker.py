@@ -38,7 +38,7 @@ def scanner(**attrs):
     globals that outlive a single check, so a leaked callback from one test would
     otherwise make the next test report a phantom finding.
     """
-    keys = ("request_delay", "time", "d", "token", "extra_headers")
+    keys = ("request_delay", "time", "d", "token", "extra_headers", "credentials")
     old = {k: getattr(aem_hacker, k) for k in keys}
     aem_hacker.d = {}
     aem_hacker.token = "TESTTOKEN"
@@ -128,6 +128,11 @@ class TestCheckContract(unittest.TestCase):
             "authenticated_as",
             "get_session",
             "build_headers",
+            "parse_credential",
+            "basic_auth_header",
+            "credentials_to_probe",
+            "primary_auth_header",
+            "username_of",
         }
         with open(aem_hacker.__file__) as fh:
             tree = ast.parse(fh.read())
@@ -397,7 +402,10 @@ class TestDefaultCredentialsFalsePositive(unittest.TestCase):
         self.assertEqual(
             len(cred_hits), 1, "a working default credential was not reported"
         )
-        self.assertIn("admin:admin", cred_hits[0].description)
+        self.assertIn("admin", cred_hits[0].description)
+        # The username is reported; the password never is, not even for a
+        # publicly known default credential.
+        self.assertNotIn("admin:admin", cred_hits[0].description)
 
 
 class TestRequestPacing(unittest.TestCase):
@@ -574,6 +582,189 @@ class TestDetections(unittest.TestCase):
         ) as target:
             findings = run_handler(aem_hacker.registered["open_redirect"], target)
         self.assertEqual(findings, [], "reported an open redirect that does not exist")
+
+
+class TestCredentialsFlag(unittest.TestCase):
+    """--creds makes the PR:L half of Adobe's CVE surface reachable.
+
+    Most AEM CVEs are low-privilege or need user interaction, so an anonymous
+    scanner structurally cannot detect them. The flag has to unlock that without
+    changing what a run with no --creds does, and without leaking the password
+    into output.
+    """
+
+    SECRET = "sup3rs3cr3t"
+
+    def test_parses_user_and_password(self):
+        self.assertEqual(aem_hacker.parse_credential("bob:pw"), ("bob", "pw"))
+
+    def test_password_may_contain_colons(self):
+        self.assertEqual(aem_hacker.parse_credential("bob:a:b:c"), ("bob", "a:b:c"))
+
+    def test_rejects_missing_colon(self):
+        with self.assertRaises(aem_hacker.CredentialError):
+            aem_hacker.parse_credential("bob")
+
+    def test_rejects_empty_username(self):
+        with self.assertRaises(aem_hacker.CredentialError):
+            aem_hacker.parse_credential(":pw")
+
+    def test_rejects_header_injection(self):
+        """A credential must not be able to terminate the header it lands in."""
+        for bad in (
+            "bob:pw\r\nX-Injected: 1",
+            "bob:pw\nX-Injected: 1",
+            "bo\r\nb:pw",
+            "bob:pw\x00",
+        ):
+            with self.assertRaises(aem_hacker.CredentialError, msg=bad):
+                aem_hacker.parse_credential(bad)
+
+    def test_basic_auth_header_encodes_correctly(self):
+        import base64
+
+        header = aem_hacker.basic_auth_header(("bob", "pw"))["Authorization"]
+        self.assertTrue(header.startswith("Basic "))
+        self.assertEqual(base64.b64decode(header[6:]).decode(), "bob:pw")
+
+    def test_falls_back_to_builtin_creds_when_flag_absent(self):
+        with scanner(credentials=[]):
+            pairs = aem_hacker.credentials_to_probe()
+        self.assertEqual(pairs[0], ("admin", "admin"))
+        self.assertIn(("author", "author"), pairs)
+
+    def test_supplied_creds_replace_the_builtin_list(self):
+        with scanner(credentials=[("bob", self.SECRET)]):
+            pairs = aem_hacker.credentials_to_probe()
+        self.assertEqual(pairs, [("bob", self.SECRET)])
+
+    def test_duplicate_creds_are_collapsed(self):
+        with scanner(credentials=[("bob", "a"), ("bob", "a"), ("eve", "b")]):
+            pairs = aem_hacker.credentials_to_probe()
+        self.assertEqual(pairs, [("bob", "a"), ("eve", "b")])
+
+    def test_primary_auth_header_is_empty_when_anonymous(self):
+        with scanner(credentials=[]):
+            self.assertEqual(aem_hacker.primary_auth_header(), {})
+
+    def test_primary_auth_header_honours_an_explicit_fallback(self):
+        with scanner(credentials=[]):
+            self.assertEqual(
+                aem_hacker.primary_auth_header(fallback=("admin", "admin")),
+                {"Authorization": "Basic YWRtaW46YWRtaW4="},
+            )
+
+    def test_supplied_creds_beat_the_fallback(self):
+        with scanner(credentials=[("bob", self.SECRET)]):
+            header = aem_hacker.primary_auth_header(fallback=("admin", "admin"))
+        import base64
+
+        self.assertEqual(
+            base64.b64decode(header["Authorization"][6:]).decode(),
+            "bob:" + self.SECRET,
+        )
+
+    def test_prl_checks_send_the_credential_when_given(self):
+        seen = []
+
+        def route(method, path, headers):
+            seen.append(headers.get("Authorization"))
+            return b"<html>nothing to see</html>"
+
+        with scanner(credentials=[("bob", self.SECRET)]):
+            with MockAEM(routes=[Route(r".*", body=route)]) as target:
+                for name in (
+                    "open_redirect",
+                    "xss_aem_forms",
+                    "xss_reflected_cve_2022",
+                ):
+                    seen.clear()
+                    run_handler(aem_hacker.registered[name], target)
+                    self.assertTrue(seen, f"{name} sent no requests")
+                    self.assertTrue(
+                        all(a is not None for a in seen),
+                        f"{name} did not send the supplied credential",
+                    )
+
+    def test_prl_checks_stay_anonymous_without_the_flag(self):
+        seen = []
+
+        def route(method, path, headers):
+            seen.append(headers.get("Authorization"))
+            return b"<html>nothing to see</html>"
+
+        with scanner(credentials=[]):
+            with MockAEM(routes=[Route(r".*", body=route)]) as target:
+                for name in (
+                    "open_redirect",
+                    "xss_aem_forms",
+                    "xss_reflected_cve_2022",
+                ):
+                    seen.clear()
+                    run_handler(aem_hacker.registered[name], target)
+                    self.assertTrue(
+                        all(a is None for a in seen),
+                        f"{name} authenticated itself with no --creds given",
+                    )
+
+    def test_password_never_reaches_the_report(self):
+        """A finding must name the user, never the credential blob."""
+        import base64
+
+        def currentuser(method, path, headers):
+            auth = headers.get("Authorization", "")
+            if not auth:
+                return b'{"authorizableId":"anonymous"}'
+            if (
+                base64.b64decode(auth.split(" ", 1)[-1]).decode()
+                == "bob:" + self.SECRET
+            ):
+                return b'{"authorizableId":"bob"}'
+            return b"<html>401 Unauthorized</html>"
+
+        with scanner(credentials=[("bob", self.SECRET)]):
+            with MockAEM(routes=[Route(r".*", body=currentuser)]) as target:
+                findings = run_handler(
+                    aem_hacker.registered["currentuser_servlet"], target
+                )
+                report = "\n".join(f.description for f in findings)
+                report += "\n".join(f.name + f.url for f in findings)
+        self.assertTrue(findings, "the working credential was not reported at all")
+        self.assertNotIn(self.SECRET, report, "the password leaked into a finding")
+        self.assertNotIn(
+            base64.b64encode("bob:{}".format(self.SECRET).encode()).decode(),
+            report,
+            "the base64 credential leaked into a finding",
+        )
+        self.assertIn("bob", report, "the username should still be reported")
+
+    def test_malformed_creds_exit_nonzero_without_echoing_the_value(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "aem_hacker.py",
+                "-u",
+                "http://x",
+                "--host",
+                "1.2.3.4",
+                "--creds",
+                "user:{}".format(self.SECRET) + "\r\nX-Injected: 1",
+            ],
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), mock.patch.object(
+            aem_hacker, "run_detector", lambda p: mock.Mock()
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                aem_hacker.main()
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertNotIn(self.SECRET, out.getvalue() + err.getvalue())
 
 
 class TestCveCoverageDoc(unittest.TestCase):

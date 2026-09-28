@@ -79,6 +79,7 @@ registered = {}  # Registered checks
 token = random_string()  # Token to recognize SSRF was triggered
 d = {}  # store SSRF detections
 extra_headers = {}
+credentials = []  # (user, password) pairs supplied via --creds
 
 request_delay = 0
 ssrf_timeout = 10  # seconds to wait for SSRF callbacks to land
@@ -115,6 +116,82 @@ def build_headers(additional_headers=None):
         # by the application in this specific request
         headers.setdefault(name, value)
     return headers
+
+
+class CredentialError(ValueError):
+    """Raised when a --creds value cannot be used as a credential."""
+
+
+def parse_credential(value):
+    """Parse one ``user:password`` string into a tuple.
+
+    The password may contain colons, so only the first one separates the two
+    parts.  CR/LF and NUL are rejected outright: this value is interpolated into
+    an HTTP header, and a credential that can terminate the header would let a
+    caller inject arbitrary request headers or split the request.
+    """
+    if not isinstance(value, str) or ":" not in value:
+        raise CredentialError(
+            "Credentials must be in 'user:password' form, got {0!r}.".format(value)
+        )
+
+    user, password = value.split(":", 1)
+
+    if not user:
+        raise CredentialError("Credential has an empty username: {0!r}".format(value))
+
+    for field, name in ((user, "username"), (password, "password")):
+        if any(ch in field for ch in "\r\n\x00"):
+            raise CredentialError(
+                "Credential {0} must not contain CR, LF or NUL characters.".format(name)
+            )
+
+    return user, password
+
+
+def primary_auth_header(fallback=None):
+    """Authorization header for the first supplied credential, else ``{}``.
+
+    Checks that need an authenticated *session* (rather than a credential
+    brute-force) use only the first pair, so supplying more credentials does not
+    multiply the request count.
+
+    With no ``--creds`` this returns an empty dict and the request stays
+    anonymous, which is how these checks have always behaved.  A check that has
+    always probed a known credential (version_disclosure) passes *fallback* to
+    keep doing so.
+    """
+    if credentials:
+        return basic_auth_header(credentials[0])
+    if fallback:
+        return basic_auth_header(fallback)
+    return {}
+
+
+def basic_auth_header(creds):
+    """Return the ``Authorization`` header for a ``user:password`` pair or string."""
+    if isinstance(creds, str):
+        creds = parse_credential(creds)
+    user, password = creds
+    token = base64.b64encode("{0}:{1}".format(user, password).encode()).decode()
+    return {"Authorization": "Basic {0}".format(token)}
+
+
+def credentials_to_probe():
+    """Return the (user, password) pairs a check should try.
+
+    The supplied ``--creds`` in order, falling back to the built-in
+    default-credential list so today's behaviour is unchanged when the flag is
+    not used.  Duplicates are removed and the order preserved.
+    """
+    pairs = list(credentials) if credentials else [parse_credential(c) for c in CREDS]
+    seen = set()
+    out = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
 
 
 class Detector(BaseHTTPRequestHandler):
@@ -203,6 +280,13 @@ def register(name, ssrf=False, experimental=False):
 IDENTITY_KEYS = ("authorizableId", "userID", "id", "profileId")
 
 
+def username_of(creds):
+    """The username from a ``user:password`` string or a ``(user, password)`` pair."""
+    if isinstance(creds, str):
+        return parse_credential(creds)[0]
+    return creds[0]
+
+
 def authenticated_as(resp, creds):
     """Return the principal name when *resp* proves *creds* were accepted, else None.
 
@@ -237,7 +321,7 @@ def authenticated_as(resp, creds):
         return None
     for key in IDENTITY_KEYS:
         if key in body:
-            return creds.split(":", 1)[0]
+            return username_of(creds)
 
     return None
 
@@ -1101,27 +1185,38 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
                     # A rejected login is any response that is not a 200 naming a
                     # real user.  Testing the body for "anonymous" alone reported
                     # every 401/403/error page as working default credentials.
-                    principal = authenticated_as(resp, creds)
+                    principal = authenticated_as(resp, (username, password))
                     if principal:
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}" '
-                            "(authenticated as {1}).".format(creds, principal),
-                        )
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -1181,26 +1276,37 @@ def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
                     # Same reasoning as the LoginStatusServlet check above: a
                     # 401/403/error body proves nothing about the credentials.
-                    principal = authenticated_as(resp, creds)
+                    principal = authenticated_as(resp, (username, password))
                     if principal:
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}" '
-                            "(authenticated as {1}).".format(creds, principal),
-                        )
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -1257,26 +1363,37 @@ def exposed_userinfo_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
                     # Same reasoning as the LoginStatusServlet check above: a
                     # 401/403/error body proves nothing about the credentials.
-                    principal = authenticated_as(resp, creds)
+                    principal = authenticated_as(resp, (username, password))
                     if principal:
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}" '
-                            "(authenticated as {1}).".format(creds, principal),
-                        )
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -2737,7 +2854,9 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
 
     for path in PRODUCTINFO:
         url = normalize_url(base_url, path)
-        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}
+        # A configured credential, else the admin:admin probe this check has
+        # always made.
+        headers = primary_auth_header(fallback=("admin", "admin"))
         try:
             resp = http_request(
                 url, additional_headers=headers, proxy=proxy, debug=debug
@@ -2799,10 +2918,11 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    auth = primary_auth_header()
     for path in REDIRECT_PATHS:
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             location = resp.headers.get("Location", "")
             # Only flag when Location is an absolute URL (https?:// or //) whose
@@ -2976,10 +3096,14 @@ def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    # Adobe rates the related AEM Forms XSS issues PR:L/UI:R, so an anonymous
+    # probe can only show the reflection primitive. Supply --creds to test the
+    # authenticated case the CVE actually describes.
+    auth = primary_auth_header()
     for path in FORMS_XSS:
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             if resp.status_code == 200 and "<1337xss>" in str(resp.content):
                 ct = content_type(resp.headers.get("Content-Type", ""))
@@ -3041,10 +3165,12 @@ def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    # Both CVEs are PR:L/UI:R; pass --creds to probe the authenticated case.
+    auth = primary_auth_header()
     for path in list(TOUCHUI_XSS) + list(SHELL_XSS):
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             if resp.status_code == 200 and "<1337xss>" in str(resp.content):
                 ct = content_type(resp.headers.get("Content-Type", ""))
@@ -3194,6 +3320,14 @@ def parse_args():
         help="seconds to wait for SSRF callbacks to arrive",
     )
     parser.add_argument(
+        "--creds",
+        action="append",
+        metavar="USER:PASS",
+        help="credential to use for checks that need an authenticated session; "
+        "repeatable. Most AEM CVEs are low-privilege or require user "
+        "interaction and cannot be detected anonymously",
+    )
+    parser.add_argument(
         "--format",
         choices=("text", "json"),
         default="text",
@@ -3278,6 +3412,7 @@ def emit(finding, sink, fmt):
 def main():
     """Entry point: start the SSRF listener, run all selected checks concurrently, and report findings."""
     global extra_headers
+    global credentials
     global request_delay
     global ssrf_timeout
 
@@ -3311,6 +3446,16 @@ def main():
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:
         extra_headers = {}
+
+    credentials = []
+    for value in args.creds or []:
+        try:
+            credentials.append(parse_credential(value))
+        except CredentialError as exc:
+            # The password is never echoed back, so a mistyped value cannot leak
+            # into a terminal scrollback or a CI log.
+            print("Bad --creds value: {0}".format(exc), file=sys.stderr)
+            sys.exit(1)
 
     if not args.url:
         print("You must specify the -u parameter, bye.")
