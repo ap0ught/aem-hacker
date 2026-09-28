@@ -890,6 +890,89 @@ class TestCveCoverageDoc(unittest.TestCase):
             )
 
 
+class TestSlurper(unittest.TestCase):
+    """aem_slurper.py must not confuse "could not read" with "nothing there".
+
+    It parsed any response as a child list, so a 401/403/404 — or a dispatcher
+    block — was walked character by character and produced no output. A security
+    crawl that reports nothing because it was blocked is indistinguishable from
+    a clean one, which is the failure mode this suite has now found twice.
+    """
+
+    def _load(self):
+        import importlib.util
+
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "aem_slurper.py",
+        )
+        spec = importlib.util.spec_from_file_location("aem_slurper", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @contextlib.contextmanager
+    def _http_conn(self, target):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", target.port, timeout=10)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def test_slurp_returns_the_status(self):
+        slurper = self._load()
+        with MockAEM() as target, self._http_conn(target) as conn:
+            data, conn, status = slurper.slurp(conn, "127.0.0.1", "/.children.json")
+        self.assertEqual(status, 404, "a 404 was not surfaced to the caller")
+
+    def test_error_page_is_not_returned_as_a_child_list(self):
+        """The caller must be able to tell JSON from an HTML error page."""
+        slurper = self._load()
+        with MockAEM() as target, self._http_conn(target) as conn:
+            data, _, status = slurper.slurp(conn, "127.0.0.1", "/.children.json")
+        self.assertNotIsInstance(data, list, "an error page was returned as a list")
+        self.assertNotEqual(status, 200)
+
+    def test_real_children_still_parse(self):
+        slurper = self._load()
+        children = [
+            {
+                "uri": "/content/page",
+                "jcr:primaryType": "cq:Page",
+                "jcr:created": "2020-05-12T02:36:36.123+0000",
+                "jcr:createdBy": "alice",
+            }
+        ]
+        body = json.dumps(children).encode()
+        with MockAEM(
+            routes=[Route(r".*", body=body, content_type="application/json")]
+        ) as target, self._http_conn(target) as conn:
+            data, _, status = slurper.slurp(conn, "127.0.0.1", "/.children.json")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(data, list)
+        self.assertEqual(data[0]["jcr:createdBy"], "alice")
+
+    def test_malformed_json_does_not_raise(self):
+        slurper = self._load()
+        with MockAEM(
+            routes=[Route(r".*", body=b"{not json", content_type="application/json")]
+        ) as target, self._http_conn(target) as conn:
+            data, _, status = slurper.slurp(conn, "127.0.0.1", "/.children.json")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(data, str, "malformed JSON should degrade, not raise")
+
+    def test_connections_carry_a_timeout(self):
+        """One unresponsive node must not hang the whole crawl."""
+        slurper = self._load()
+        self.assertGreater(slurper.TIMEOUT, 0)
+        with MockAEM() as target:
+            conn = slurper.connect("127.0.0.1")
+            self.assertEqual(conn.timeout, slurper.TIMEOUT)
+            conn.close()
+
+
 class TestSiblingScripts(unittest.TestCase):
     """The other scripts in the repo have their own silent-failure modes.
 
