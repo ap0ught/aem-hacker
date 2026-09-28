@@ -1,5 +1,9 @@
-# Runtime dependencies for all aem-hacker scripts.
+# Runtime dependencies for aem_hacker.py, aem_discoverer.py, aem_slurper.py,
+# aem_server.py and aem_ssrf2rce.py.
 # Pin versions so that installs are reproducible and auditable.
 requests>=2.31.0,<3.0.0
-dpath>=2.2.0,<3.0.0
 urllib3>=2.0.0,<3.0.0
+
+# aem_enum.py additionally needs dpath. It is kept out of the core requirements
+# so the main scanner installs without it:
+#     pip install -r requirements-enum.txt

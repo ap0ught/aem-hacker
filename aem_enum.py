@@ -18,16 +18,25 @@ import json
 import time
 import datetime
 import argparse
+import threading
 import itertools
 import traceback
 import concurrent.futures
 from threading import Lock
 
 import urllib3
-import dpath
 import requests
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# dpath is only needed by this script, so it is an optional extra rather than a
+# hard dependency of the main scanner (see requirements-enum.txt). Import it
+# lazily with an actionable message: a bare ImportError here used to be swallowed
+# further down, which made the tool look like it simply found nothing.
+try:
+    import dpath
+except ImportError:  # pragma: no cover - depends on the install
+    dpath = None
 
 
 users = set()
@@ -60,6 +69,18 @@ def normalize_url(base_url, path):
     return url
 
 
+_local = threading.local()
+
+
+def get_session():
+    """Return this thread's shared :class:`requests.Session`, creating it once."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _local.session = session
+    return session
+
+
 def http_request(url, method="GET", data=None, additional_headers=None, proxy=None):
     """Send an HTTP request and return the response.
 
@@ -76,7 +97,11 @@ def http_request(url, method="GET", data=None, additional_headers=None, proxy=No
     if not proxy:
         proxy = {}
 
-    resp = requests.request(
+    # One session per worker thread.  requests.request() builds (and throws
+    # away) a Session per call, so every node in the JCR walk paid for a fresh
+    # TCP and TLS handshake.
+    session = get_session()
+    resp = session.request(
         method,
         url,
         data=data,
@@ -180,7 +205,7 @@ def process_node_get_servlet(
         result = []
         for d in range(grab_depth):
             result.extend(
-                list(dpath.util.search(parsed, "*/" * d + USERS_GLOB, yielded=True))
+                list(dpath.search(parsed, "*/" * d + USERS_GLOB, yielded=True))
             )  # Grab usernames at each level in subtree
 
         for _, username in result:  # Extract unique usernames
@@ -190,7 +215,7 @@ def process_node_get_servlet(
             results = []
             for d in range(grab_depth):
                 results.extend(
-                    list(dpath.util.search(parsed, "*/" * d + s_glob, yielded=True))
+                    list(dpath.search(parsed, "*/" * d + s_glob, yielded=True))
                 )  # Grab secret using current glob at each level in subtree
 
             for secret, _ in results:
@@ -201,7 +226,7 @@ def process_node_get_servlet(
 
         paths_to_observe = set()
         for leaf in list(
-            dpath.util.search(parsed, "*/" * grab_depth + USERS_GLOB, yielded=True)
+            dpath.search(parsed, "*/" * grab_depth + USERS_GLOB, yielded=True)
         ):  # Get path to leaf node from subtree root
             p = leaf[0].rsplit("/", 1)[0]
             paths_to_observe.add(p)
@@ -226,8 +251,11 @@ def process_node_get_servlet(
     except Exception:
         if debug:
             error("Exception", method="process_node_get_servlet")
-    finally:
-        return users, secrets
+
+    # Deliberately outside the `finally`: a `return` there would also swallow
+    # KeyboardInterrupt/SystemExit, so Ctrl-C on a long crawl would look like a
+    # clean run that happened to stop early.
+    return users, secrets
 
 
 def handle_finding(future):
@@ -290,6 +318,14 @@ def main():
     global users, secrets, running, lock
 
     args = parse_args()
+
+    if dpath is None:
+        print(
+            "aem_enum.py needs dpath, which is an optional extra:\n"
+            "    pip install -r requirements-enum.txt",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.proxy:
         p = args.proxy

@@ -37,7 +37,12 @@ class testHTTPServer_RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.do_print("POST")
 
+        # Content-Length is mandatory even on an empty body: without it the
+        # response ends mid-header-stream and the SSRF client sees a reset
+        # connection instead of a 200.
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
         self.end_headers()
         return
 
@@ -50,7 +55,7 @@ class testHTTPServer_RequestHandler(BaseHTTPRequestHandler):
             data = f.read()
 
         self.send_header("Content-type", "application/octet-stream")
-        self.send_header("Content-length", len(data))
+        self.send_header("Content-length", str(len(data)))
         self.end_headers()
 
         self.wfile.write(data)

@@ -57,7 +57,8 @@ Following checks are currently implemented:
 usage: aem_hacker.py [-h] [-u URL] [--proxy PROXY] [--debug] [--host HOST]
                      [--port PORT] [--workers WORKERS]
                      [-H [HEADER [HEADER ...]]] [--handler HANDLER]
-                     [--listhandlers]
+                     [--listhandlers] [--delay DELAY] [--ssrf-timeout SSRF_TIMEOUT]
+                     [--format {text,json}] [--output OUTPUT]
 
 AEM hacker by @0ang3el, see the slides -
 https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps
@@ -76,7 +77,31 @@ optional arguments:
   --handler HANDLER     run specific handlers, if omitted run all handlers
   --listhandlers        list available handlers
   --delay DELAY         seconds between requests
+  --ssrf-timeout SSRF_TIMEOUT
+                        seconds to wait for SSRF callbacks to arrive
+  --format {text,json}  output format; 'json' is one finding per line
+  --strict              skip checks marked experimental (see below)
+  --output OUTPUT       write the report to a file instead of stdout
+
+Findings are printed as each check finishes, and the exit status is 1 when
+anything was found, so the tool composes in a pipeline:
+
 ```
+aem_hacker.py -u https://aem.webapp --format json --output findings.json || echo "something was found"
+```
+
+(The usage block above is abridged for readability — `aem_hacker.py -h` is
+authoritative.)
+
+**Experimental checks.** Five of the checks carry CVE numbers that an audit
+found to be wrong: CVE-2023-38205 is an Adobe *ColdFusion* issue, CVE-2021-40722
+is an XXE rather than an SSRF, CVE-2021-36063 is *Adobe Connect*, CVE-2022-30679
+ships in a different bulletin than its sibling, and the AEM open redirect is
+CVE-2023-29307 (3.5 Low, not CVE-2023-29297 at 6.1). The techniques those checks
+probe are real, but their detection logic has never been validated against a live
+AEM. Findings from them are prefixed `[UNVERIFIED CHECK]`, and `--strict` skips
+them entirely. The full audit, with vendor bulletin citations, is in
+[CVE_COVERAGE.md](CVE_COVERAGE.md#-provenance-and-audit-status).
 
 #### Example
 ```
@@ -88,6 +113,38 @@ or
 ```
 python3 aem_hacker.py -u https://aem.webapp --host your_vps_hostname_ip --handler groovy_console --handler salesforcesecret_servlet
 
+```
+
+## Tests
+
+The scanner has a dependency-free test suite (stdlib `unittest` plus a mock AEM
+target) covering the request layer, the SSRF callback listener, the CLI, the
+sibling scripts, and the contract that every registered check is reachable and
+safe to run. It runs in CI on every push and pull request:
+
+```
+./tests/run_tests.sh
+python3 tests/bench.py HEAD    # compare request/connection/wall-time cost against a revision
+```
+
+## aem_enum.py
+
+Enumerates usernames and secret-looking nodes from an AEM webapp whose JCR tree
+is exposed via `DefaultGetServlet`. It walks the JCR tree, collecting any
+attribute whose key ends in `By` (e.g. `jcr:createdBy`, `cq:lastModifiedBy`) as a
+username hint, and any child node matching a credential-ish pattern (passwords,
+credentials, `*.key`, `*.pem`, config/backup archives) as a URL worth fetching.
+Results go to a `|`-delimited CSV.
+
+Requires `dpath`, which is an optional extra:
+
+```
+pip install -r requirements-enum.txt
+```
+
+#### Usage
+```
+python3 aem_enum.py --url https://aem.webapp --out findings.csv --maxdepth 6
 ```
 
 ## aem_discoverer.py
