@@ -95,22 +95,24 @@ Which checks use it:
 | Check | Without `--creds` | With `--creds` |
 |---|---|---|
 | `xss_aem_forms`, `xss_reflected_cve_2022`, `open_redirect` | anonymous | sends the credential — the `PR:L` case Adobe actually describes |
-| `loginstatus_servlet`, `userinfo_servlet`, `currentuser_servlet` | tries the built-in default-credential list | tries the supplied credentials instead |
+| `loginstatus_servlet`, `userinfo_servlet`, `currentuser_servlet` | tries the built-in default-credential list | tries the built-in list **plus** the supplied credentials |
 | `version_disclosure` (product-info probe) | `admin:admin`, as it always has | sends the supplied credential |
 
 Properties worth knowing:
 
-* With no `--creds`, **every check behaves exactly as it did before**: the
-  anonymous path is unchanged, and the one check that has always probed a
-  credential still does.
+* With no `--creds`, the credential checks probe **the same set of credentials
+  as before** and the anonymous path is unchanged. Note that two checks
+  (`currentuser_servlet`, `reports`) are new to the default scan on this branch:
+  they existed but were unreachable.
 * Supplied credentials are **added to** the built-in default-credential list, not
   substituted for it — using `--creds` to reach a `PR:L` check does not silently
   disable "AEM with default credentials" detection.
 * Only the **first** credential is used for session-style probes, so supplying
   several does not multiply the request count. The default-credential checks try
   all of them in place of their built-in list.
-* The password is **never** written to a finding, to stdout, or to an error
-  message; only the username is reported.
+* The password **value** is never written to a finding, to stdout, or to an error
+  message; only the username is reported. Two rejection messages disclose its
+  *length* rather than its content.
 * CR, LF and NUL are rejected in a credential, because the value is interpolated
   into an HTTP header and one that could terminate the header would allow request
   smuggling.

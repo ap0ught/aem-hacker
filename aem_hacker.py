@@ -47,6 +47,7 @@ import sys
 import argparse
 import base64
 import os
+import urllib.parse
 import socket
 import threading
 import time
@@ -104,6 +105,22 @@ def get_session():
         session = requests.Session()
         _local.session = session
     return session
+
+
+def note_request(ok):
+    """Record a request outcome for the check currently running on this thread.
+
+    Every check swallows its own exceptions, so a check whose every request was
+    refused returns an empty list and is indistinguishable from a clean one. The
+    tally lets main() tell those apart.
+    """
+    tally = getattr(_local, "requests", None)
+    if tally is not None:
+        tally.append(ok)
+
+
+def request_tally():
+    return getattr(_local, "requests", None)
 
 
 def build_headers(additional_headers=None):
@@ -185,6 +202,13 @@ def load_creds_file(path):
         raise CredentialError(
             "Could not read credentials file: {0}".format(exc.strerror or exc)
         ) from None
+    except UnicodeDecodeError:
+        # Credentials are ISO-8859-1 on the wire, so a file in that encoding is
+        # plausible; say so rather than raising a raw codec traceback.
+        raise CredentialError(
+            "Credentials file is not valid UTF-8. Re-save it as UTF-8, or pass "
+            "the credential with --creds."
+        ) from None
 
     pairs = []
     for number, line in enumerate(raw.splitlines(), start=1):
@@ -207,6 +231,7 @@ def warn_if_world_readable(path):
     except OSError:
         return
     if mode & 0o077:
+        # A warning, not an error: the scan can still proceed.
         print(
             "[!] Credentials file {0} is readable by other users "
             "(mode {1:o}); consider chmod 600.".format(path, mode & 0o777),
@@ -278,6 +303,27 @@ def basic_auth_header(creds):
     return {"Authorization": "Basic {0}".format(encoded)}
 
 
+def decode_callback(raw, base_url):
+    """Decode an SSRF callback segment, or return None if it is not ours.
+
+    The correlation token is disclosed to every target the scanner touches (it is
+    part of the outbound URL), and the listener binds 0.0.0.0, so the target
+    itself — or anything else that can reach the port — can seed the callback
+    store. An empty segment also decodes successfully, which would otherwise
+    produce a finding with a blank URL for a target with no SSRF at all.
+
+    Only a callback naming a URL beginning with the *base_url* this check was
+    given is accepted.
+    """
+    try:
+        value = base64.b16decode(raw).decode()
+    except Exception:
+        return None
+    if not value or not value.startswith(base_url):
+        return None
+    return value
+
+
 def credentials_to_probe():
     """Return the (user, password) pairs a check should try.
 
@@ -310,8 +356,12 @@ class Detector(BaseHTTPRequestHandler):
     # holds a worker thread and a file descriptor forever.
     timeout = 15
 
-    # Cap what one key can accumulate, so a peer cannot grow this without bound.
+    # Bound what a peer can make this process allocate. The listener binds
+    # 0.0.0.0 and the correlation token is disclosed to every target the scanner
+    # touches, so an unauthenticated peer can reach this code.
     max_values_per_key = 32
+    max_keys = 256
+    max_key_length = 64
 
     def __init__(self, token, d, *args):
         self.d = d
@@ -330,6 +380,23 @@ class Detector(BaseHTTPRequestHandler):
     def do_PUT(self):
         self.serve()
 
+    def record(self, key, value):
+        """Store a callback, within the configured bounds.
+
+        Capping values per key is not enough on its own: without a cap on the
+        number of distinct keys, a peer can still grow this without bound. The
+        listener binds 0.0.0.0 and the token is disclosed to every target the
+        scanner touches, so this code is reachable unauthenticated.
+        """
+        if len(key) > self.max_key_length:
+            return False
+        if key not in self.d and len(self.d) >= self.max_keys:
+            return False
+        values = self.d.setdefault(key, [])
+        if len(values) < self.max_values_per_key:
+            values.append(value)
+        return True
+
     def serve(self):
         """Record an SSRF hit if the path token matches and respond 200."""
         try:
@@ -342,9 +409,7 @@ class Detector(BaseHTTPRequestHandler):
             self.reply()
             return
 
-        values = self.d.setdefault(key, [])
-        if len(values) < self.max_values_per_key:
-            values.append(value)
+        self.record(key, value)
 
         self.reply()
 
@@ -395,6 +460,11 @@ IDENTITY_KEYS = ("authorizableId", "userID", "userid", "profileId")
 # An explicit rejection wins over anything else in the body.
 REJECTED_RE = re.compile(r'"?authenticated"?\s*[:=]\s*"?false', re.IGNORECASE)
 
+# Form-encoded responses: userid=admin&resource=/...
+FORM_IDENTITY_RE = re.compile(
+    r"(?:^|[?&])(?:authorizableId|userid|profileId)=([^&\"'\s<>]+)", re.IGNORECASE
+)
+
 # Structural match for non-JSON bodies, so a stray "id" is not enough.
 IDENTITY_RE = re.compile(
     r"\b(authorizableId|userid|profileid)\b\s*[:=]\s*[\"\']([^\"\'<>\s,&]+)",
@@ -426,23 +496,35 @@ def authenticated_as(resp, creds):
     if resp.status_code != 200:
         return None
 
+    body = resp.content.decode(errors="replace")
+
     try:
-        payload = json.loads(resp.content.decode())
+        payload = json.loads(body)
     except Exception:
         payload = None
 
+    # An explicit rejection wins over anything else in the body, in every format.
+    # Applied to the raw body rather than to the parsed dict so that
+    # {"authenticated": false} and {"authenticated": "false"} agree.
+    if REJECTED_RE.search(body) or "anonymous" in body:
+        return None
+
     if isinstance(payload, dict):
-        if payload.get("authenticated") is False:
-            return None
         for key in IDENTITY_KEYS:
             principal = payload.get(key)
             if isinstance(principal, str) and principal and principal != "anonymous":
                 return principal
         return None
 
-    body = resp.content.decode(errors="replace")
-    if REJECTED_RE.search(body) or "anonymous" in body:
+    # The form-encoded shape this servlet also returns:
+    #   authenticated=true&userid=admin&resource=/
+    form = FORM_IDENTITY_RE.search(body)
+    if form:
+        principal = form.group(1)
+        if principal != "anonymous":
+            return principal
         return None
+
     match = IDENTITY_RE.search(body)
     if match and match.group(2) != "anonymous":
         return match.group(2)
@@ -497,7 +579,8 @@ def http_request(
     proxies = proxy if proxy else {}
 
     if debug:
-        print(">> Sending {} {}".format(method, url))
+        # stderr, not stdout: stdout is the machine-readable channel.
+        print(">> Sending {} {}".format(method, url), file=sys.stderr)
 
     # One delay per request, not one per hop.
     if request_delay:
@@ -536,8 +619,9 @@ def http_request(
         raise ValueError("Unsupported HTTP method: {}".format(method))
 
     if debug:
-        print("<< Received HTTP-{}".format(resp.status_code))
+        print("<< Received HTTP-{}".format(resp.status_code), file=sys.stderr)
 
+    note_request(True)
     return resp
 
 
@@ -553,7 +637,8 @@ def http_request_multipart(
     proxies = proxy if proxy else {}
 
     if debug:
-        print(">> Sending {} {}".format(method, url))
+        # stderr, not stdout: stdout is the machine-readable channel.
+        print(">> Sending {} {}".format(method, url), file=sys.stderr)
 
     if request_delay:
         time.sleep(request_delay)
@@ -571,8 +656,9 @@ def http_request_multipart(
     )
 
     if debug:
-        print("<< Received HTTP-{}".format(resp.status_code))
+        print("<< Received HTTP-{}".format(resp.status_code), file=sys.stderr)
 
+    note_request(True)
     return resp
 
 
@@ -1236,7 +1322,9 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
 
     for path, creds in itertools.product(POSTSERVLET, creds_list):
         username = username_of(creds)
-        path = path.format(username)
+        # Escape: an unescaped username could contain '/' or '..' and retarget
+        # the request.
+        path = path.format(urllib.parse.quote(username, safe=""))
         url = normalize_url(base_url, path)
         try:
             headers = {
@@ -1954,25 +2042,25 @@ def ssrf_salesforcesecret_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "salesforcesecret" in d:
-        try:
-            u = base64.b16decode(d.get("salesforcesecret")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("salesforcesecret")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'salesforcesecret' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'salesforcesecret' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "SalesforceSecretServlet",
-            u,
-            "SSRF via SalesforceSecretServlet (CVE-2018-5006) was detected. "
-            "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
-        )
+        else:
+            f = Finding(
+                "SalesforceSecretServlet",
+                u,
+                "SSRF via SalesforceSecretServlet (CVE-2018-5006) was detected. "
+                "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2080,25 +2168,25 @@ def ssrf_reportingservices_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "reportingservices" in d:
-        try:
-            u = base64.b16decode(d.get("reportingservices")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("reportingservices")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'reportingservices' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'reportingservices' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "ReportingServicesServlet",
-            u,
-            "SSRF via ReportingServicesServlet (CVE-2018-12809) was detected. "
-            "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
-        )
+        else:
+            f = Finding(
+                "ReportingServicesServlet",
+                u,
+                "SSRF via ReportingServicesServlet (CVE-2018-12809) was detected. "
+                "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2205,25 +2293,25 @@ def ssrf_sitecatalyst_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "sitecatalyst" in d:
-        try:
-            u = base64.b16decode(d.get("sitecatalyst")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("sitecatalyst")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'sitecatalyst' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'sitecatalyst' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "SiteCatalystServlet",
-            u,
-            "SSRF via SiteCatalystServlet was detected. "
-            "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
-        )
+        else:
+            f = Finding(
+                "SiteCatalystServlet",
+                u,
+                "SSRF via SiteCatalystServlet was detected. "
+                "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2324,25 +2412,25 @@ def ssrf_autoprovisioning_servlet(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "autoprovisioning" in d:
-        try:
-            u = base64.b16decode(d.get("autoprovisioning")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("autoprovisioning")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'autoprovisioning' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'autoprovisioning' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "AutoProvisioningServlet",
-            u,
-            "SSRF via AutoProvisioningServlet was detected. "
-            "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
-        )
+        else:
+            f = Finding(
+                "AutoProvisioningServlet",
+                u,
+                "SSRF via AutoProvisioningServlet was detected. "
+                "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2431,25 +2519,25 @@ def ssrf_opensocial_proxy(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "opensocial" in d:
-        try:
-            u = base64.b16decode(d.get("opensocial")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("opensocial")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'opensocial' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'opensocial' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "Opensocial (shindig) proxy",
-            u,
-            "SSRF via Opensocial (shindig) proxy. "
-            "See - https://speakerdeck.com/fransrosen/a-story-of-the-passive-aggressive-sysadmin-of-aem?slide=41",
-        )
+        else:
+            f = Finding(
+                "Opensocial (shindig) proxy",
+                u,
+                "SSRF via Opensocial (shindig) proxy. "
+                "See - https://speakerdeck.com/fransrosen/a-story-of-the-passive-aggressive-sysadmin-of-aem?slide=41",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2550,24 +2638,24 @@ def ssrf_opensocial_makeRequest(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "opensocialmakerequest" in d:
-        try:
-            u = base64.b16decode(d.get("opensocialmakerequest")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("opensocialmakerequest")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'opensocialmakerequest' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'opensocialmakerequest' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "Opensocial (shindig) makeRequest",
-            u,
-            "SSRF via Opensocial (shindig) makeRequest. You can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
-        )
+        else:
+            f = Finding(
+                "Opensocial (shindig) makeRequest",
+                u,
+                "SSRF via Opensocial (shindig) makeRequest. You can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2981,25 +3069,13 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
             "/libs/granite/core/content/login.html",
             "///libs///granite///core///content///login.html",
         ),
-        (
-            "",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-            ";%0a{0}.html",
-        ),
+        ("", "/{0}.css", "/{0}.html", ";%0a{0}.css", ";%0a{0}.html"),
     )
     LOGINPATHS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in LOGINPATHS)
 
     PRODUCTINFO = itertools.product(
         ("/system/console/productinfo", "///system///console///productinfo"),
-        (
-            "",
-            ".json",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-        ),
+        ("", ".json", "/{0}.css", "/{0}.html", ";%0a{0}.css"),
     )
     PRODUCTINFO = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in PRODUCTINFO)
 
@@ -3173,16 +3249,8 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
     r = random_string(3)
 
     FELIX_BYPASS = itertools.product(
-        (
-            "//system//console//bundles",
-            "////system////console////bundles",
-        ),
-        (
-            "",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-        ),
+        ("//system//console//bundles", "////system////console////bundles"),
+        ("", "/{0}.css", "/{0}.html", ";%0a{0}.css"),
     )
     FELIX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in FELIX_BYPASS)
 
@@ -3193,11 +3261,7 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
             "//crx//de//index.jsp",
             "////crx////de////index.jsp",
         ),
-        (
-            "",
-            ";%0a{0}.css",
-            "/{0}.css",
-        ),
+        ("", ";%0a{0}.css", "/{0}.css"),
     )
     CRX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in CRX_BYPASS)
 
@@ -3277,11 +3341,7 @@ def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
 
     # Common AEM Forms endpoints known to reflect unsanitised input
     FORMS_XSS = itertools.product(
-        (
-            "/content/forms/af",
-            "/libs/fd/af/components",
-            "///content///forms///af",
-        ),
+        ("/content/forms/af", "/libs/fd/af/components", "///content///forms///af"),
         (
             ".html?{0}=<1337xss>",
             ".json/{0}.html?dummyParam=<1337xss>",
@@ -3460,30 +3520,44 @@ def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
     time.sleep(ssrf_timeout)
 
     if "cve202140722" in d:
-        try:
-            u = base64.b16decode(d.get("cve202140722")[0]).decode()
-        except Exception:
-            # A callback arrived but could not be decoded (percent-encoding, a query
-            # string, truncation). The SSRF happened; we just cannot name the URL.
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("cve202140722")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
             print(
-                "[!] Received an unparseable 'cve202140722' SSRF callback; see the "
-                "listener output for the raw path.",
+                "[!] Ignoring an SSRF callback for 'cve202140722' that did not "
+                "name a requested URL.",
                 file=sys.stderr,
             )
-            u = "unknown"
-        f = Finding(
-            "SSRF (unverified CVE attribution)",
-            u,
-            "The content-sync/replication endpoint fetched a caller-supplied URL, "
-            "which indicates an SSRF. NOTE: this is not CVE-2021-40722 -- that CVE "
-            "is an XXE/RCE (APSB21-103, 9.8 Critical) and is not detected here. The "
-            "nearest AEM SSRF is CVE-2021-28627 (APSB21-39, 5.4, PR:L). An attacker "
-            "can pivot to internal services. This check is unvalidated; confirm "
-            "manually before reporting.",
-        )
-        results.append(f)
+        else:
+            f = Finding(
+                "SSRF (unverified CVE attribution)",
+                u,
+                "The content-sync/replication endpoint fetched a caller-supplied URL, "
+                "which indicates an SSRF. NOTE: this is not CVE-2021-40722 -- that CVE "
+                "is an XXE/RCE (APSB21-103, 9.8 Critical) and is not detected here. The "
+                "nearest AEM SSRF is CVE-2021-28627 (APSB21-39, 5.4, PR:L). An attacker "
+                "can pivot to internal services. This check is unvalidated; confirm "
+                "manually before reporting.",
+            )
+            results.append(f)
 
     return results
+
+
+# Exit codes. Kept distinct on purpose: a consumer of this tool most needs to
+# tell "this is vulnerable" apart from "I could not scan this".
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_INCOMPLETE = 2
+EXIT_USAGE = 3
+
+
+def usage_error(message):
+    """Report a usage or preflight problem and exit with EXIT_USAGE."""
+    print(message, file=sys.stderr)
+    sys.exit(EXIT_USAGE)
 
 
 def parse_args():
@@ -3554,8 +3628,7 @@ def parse_args():
         "as unverified when they do run",
     )
     parser.add_argument(
-        "--output",
-        help="write the report to this file instead of stdout",
+        "--output", help="write the report to this file instead of stdout"
     )
 
     return parser.parse_args(sys.argv[1:])
@@ -3599,6 +3672,21 @@ def run_detector(port):
     t.start()
 
     return httpd
+
+
+def run_check(check, base_url, my_host, debug, proxy):
+    """Run one check on this worker thread, recording its request outcomes.
+
+    Returns ``(findings, requests_made)``. A check whose every request failed
+    returns an empty finding list that looks exactly like a clean result, so the
+    caller needs the tally to tell the two apart.
+    """
+    _local.requests = []
+    try:
+        results = check(base_url, my_host, debug, proxy)
+        return results, list(_local.requests)
+    finally:
+        _local.requests = None
 
 
 def emit(finding, sink, fmt):
@@ -3650,20 +3738,18 @@ def main():
             # (e.g. X-Custom-Header: key:value:data) are preserved intact.
             header_data = header.split(":", 1)
             if len(header_data) != 2 or not header_data[0].strip():
-                print(
+                usage_error(
                     "Malformed header '{0}'. Expected format: 'Name: Value'.".format(
                         header
-                    )
+                    ),
                 )
-                sys.exit(1)
             # Same reasoning as --creds: this value is interpolated into a request
             # header, and one containing CR/LF could split the request.
             if any(ch in header for ch in "\r\n\x00"):
-                print(
+                usage_error(
                     "Header names and values must not contain CR, LF or NUL "
-                    "characters."
+                    "characters.",
                 )
-                sys.exit(1)
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:
         extra_headers = {}
@@ -3673,21 +3759,25 @@ def main():
     except CredentialError as exc:
         # The password is never echoed back, so a mistyped value cannot leak
         # into a terminal scrollback or a CI log.
-        print("Bad credential: {0}".format(exc), file=sys.stderr)
-        sys.exit(1)
+        usage_error(
+            "Bad credential: {0}".format(exc),
+        )
 
     if not args.url:
-        print("You must specify the -u parameter, bye.")
-        sys.exit(1)
+        usage_error(
+            "You must specify the -u parameter, bye.",
+        )
 
     if args.handler:
         unknown = [h for h in args.handler if h not in registered]
         if unknown:
             # Silently scanning nothing looks identical to a clean result, which
             # is the worst possible failure mode for a security tool.
-            print("Unknown handler(s): {0}".format(", ".join(unknown)))
-            print("Available handlers: {0}".format(", ".join(sorted(registered))))
-            sys.exit(1)
+            usage_error(
+                "Unknown handler(s): {0}\nAvailable handlers: {1}".format(
+                    ", ".join(unknown), ", ".join(sorted(registered))
+                )
+            )
         selected = [(name, registered[name]) for name in args.handler]
     else:
         selected = list(registered.items())
@@ -3697,6 +3787,8 @@ def main():
             name for name, func in selected if getattr(func, "experimental", False)
         ]
         if skipped:
+            # A warning, not an error: --strict filters the experimental checks
+            # out and scans the rest.
             print(
                 "[*] --strict: skipping {0} experimental check(s): {1}".format(
                     len(skipped), ", ".join(skipped)
@@ -3711,28 +3803,25 @@ def main():
         if not selected:
             # Running zero checks and reporting "0 findings, clean" is the same
             # failure mode as a scan where every check crashed.
-            print(
+            usage_error(
                 "No checks left to run: every selected check is experimental. "
-                "Drop --strict, or name a non-experimental check with --handler.",
-                file=sys.stderr,
+                "Drop --strict, or name a non-experimental check with --handler."
             )
-            sys.exit(1)
 
     # --host is only needed by the checks that wait on a callback.  Demanding a
     # public VPS to run, say, the Groovy Console check was pure friction.
     needs_host = any(getattr(func, "ssrf", False) for _, func in selected)
     if needs_host and not args.host:
-        print(
+        usage_error(
             "You must specify the --host parameter: the selected checks detect "
             "SSRF by waiting for a callback. Use --listhandlers to see which "
             "checks need it.",
-            file=sys.stderr,
         )
-        sys.exit(1)
 
     if not preflight(args.url, proxy):
-        print("Seems that you provided bad URL. Try another one, bye.")
-        sys.exit(1)
+        usage_error(
+            "Seems that you provided bad URL. Try another one, bye.",
+        )
 
     httpd = run_detector(args.port) if needs_host else None
 
@@ -3747,48 +3836,69 @@ def main():
     interrupted = False
     # Findings are streamed as each check finishes, so a long scan shows progress
     # and its results survive a crash or a Ctrl-C partway through.
+    # Use the port the listener actually bound. run_detector falls back to a
+    # free port when the requested one is unavailable (port 80 needs root), and
+    # telling the checks the requested port would point every callback at a dead
+    # port -- making all seven SSRF checks silently return nothing.
+    my_host = "{0}:{1}".format(
+        args.host, httpd.server_address[1] if httpd is not None else args.port
+    )
+
+    tpe = concurrent.futures.ThreadPoolExecutor(args.workers)
     try:
-        with concurrent.futures.ThreadPoolExecutor(args.workers) as tpe:
-            futures = {}
-            for name, check in selected:
-                # Use the port the listener actually bound. run_detector falls
-                # back to a free port when the requested one is unavailable
-                # (port 80 needs root), and telling the checks the requested port
-                # would point every callback at a dead port -- making all seven
-                # SSRF checks silently return nothing.
-                my_host = "{0}:{1}".format(
-                    args.host, httpd.server_address[1] if httpd else args.port
+        futures = {}
+        for name, check in selected:
+            futures[
+                tpe.submit(run_check, check, args.url, my_host, args.debug, proxy)
+            ] = name
+
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                results, requests_made = future.result()
+            except Exception:
+                # One broken check must never discard the findings the other
+                # 30-odd checks already produced.
+                failed_checks += 1
+                print(
+                    "[!] Check '{0}' failed and was skipped:".format(name),
+                    file=sys.stderr,
                 )
-                futures[tpe.submit(check, args.url, my_host, args.debug, proxy)] = name
+                error("Exception while running a check", check=name)
+                continue
 
-            for future in concurrent.futures.as_completed(futures):
-                name = futures[future]
-                try:
-                    results = future.result()
-                except Exception:
-                    # One broken check must never discard the findings the other
-                    # 30-odd checks already produced.
-                    failed_checks += 1
-                    print(
-                        "[!] Check '{0}' failed and was skipped:".format(name),
-                        file=sys.stderr,
+            if not any(requests_made):
+                # Every request this check made failed, and checks swallow their
+                # own exceptions -- so this looks like "found nothing" unless we
+                # look at the tally. A dead target must not read as a clean scan.
+                failed_checks += 1
+                print(
+                    "[!] Check '{0}' made no successful request; treating it as "
+                    "inconclusive, not clean.".format(name),
+                    file=sys.stderr,
+                )
+                continue
+
+            for finding in results or []:
+                findings += 1
+                if getattr(registered.get(name), "experimental", False):
+                    # Never let an unvalidated result read as a confirmed one.
+                    finding = Finding(
+                        finding.name,
+                        finding.url,
+                        "[UNVERIFIED CHECK] " + finding.description,
                     )
-                    error("Exception while running a check", check=name)
-                    continue
-
-                for finding in results or []:
-                    findings += 1
-                    if getattr(registered.get(name), "experimental", False):
-                        # Never let an unvalidated result read as a confirmed one.
-                        finding = Finding(
-                            finding.name,
-                            finding.url,
-                            "[UNVERIFIED CHECK] " + finding.description,
-                        )
-                    emit(finding, sink, args.format)
+                emit(finding, sink, args.format)
     except KeyboardInterrupt:
         interrupted = True
-        print("\n[!] Interrupted.", file=sys.stderr)
+        print("\n[!] Interrupted; cancelling outstanding checks.", file=sys.stderr)
+        # Not `with`: the context manager's __exit__ waits for every running
+        # check, so Ctrl-C would keep hammering the target for minutes (and the
+        # seven SSRF checks each sleep --ssrf-timeout) before the exit code
+        # finally appeared. cancel_futures drops the not-yet-started ones.
+        tpe.shutdown(wait=False, cancel_futures=True)
+    else:
+        tpe.shutdown(wait=True)
     finally:
         if httpd is not None:
             httpd.shutdown()
@@ -3808,8 +3918,8 @@ def main():
     # whose checks all crashed, or that was interrupted, must never be
     # indistinguishable from a clean bill of health.
     if interrupted or failed_checks:
-        return 2
-    return 1 if findings else 0
+        return EXIT_INCOMPLETE
+    return EXIT_FINDINGS if findings else EXIT_CLEAN
 
 
 if __name__ == "__main__":

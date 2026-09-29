@@ -92,9 +92,14 @@ the tool composes in a pipeline:
 
 | Exit | Meaning |
 |---|---|
-| `0` | clean — every selected check ran and found nothing |
+| `0` | clean — every selected check reached the target and found nothing |
 | `1` | something was found |
-| `2` | the scan did **not** complete: a check crashed, or it was interrupted |
+| `2` | the scan did **not** complete: a check crashed, a check never reached the target, or it was interrupted |
+| `3` | the scan could not start: bad arguments, unknown handler, or an unreachable URL |
+
+`3` exists so that `|| echo "something was found"` cannot fire for a typo or a
+dead host. "I could not scan this" and "this is vulnerable" are the two facts a
+consumer of this tool most needs to keep apart.
 
 Exit `2` exists so a failed or truncated scan is never mistaken for a clean bill
 of health:
@@ -132,8 +137,10 @@ allowed) and warns if the file is readable by other users. All three sources
 combine, and supplied credentials are *added to* the built-in default list rather
 than replacing it.
 
-The password is never written to a finding, to stdout, or to an error message —
-only the username is reported. With no credential flags at all, every check
+The password *value* is never written to a finding, to stdout, or to an error
+message; only the username is reported. Two rejection messages disclose the
+password's *length* rather than its content, so a mistyped value can be
+diagnosed without printing it. With no credential flags at all, every check
 behaves exactly as before. Only the first
 credential is used for session-style probes, so supplying more does not multiply
 the request count; the default-credential checks try all of them in place of

@@ -97,6 +97,27 @@ class GlobalIsolationTestCase(unittest.TestCase):
             setattr(aem_hacker, name, value)
 
 
+def with_liveness(inner):
+    """Wrap a synthetic check so it reports one successful request.
+
+    A check that never completes an HTTP request is now reported as inconclusive
+    (exit 2) rather than clean, which is right for real checks but would make
+    every synthetic check in this file look broken. Liveness itself is covered by
+    its own tests against a real target.
+    """
+
+    def wrapped(base_url, my_host, debug=False, proxy=None):
+        aem_hacker.note_request(True)
+        return inner(base_url, my_host, debug, proxy)
+
+    # Carry the metadata main() inspects, or --strict and the --host requirement
+    # silently stop seeing these checks.
+    wrapped.ssrf = getattr(inner, "ssrf", False)
+    wrapped.experimental = getattr(inner, "experimental", False)
+
+    return wrapped
+
+
 def free_port():
     """Ask the OS for an unused TCP port and release it again."""
     import socket
@@ -181,6 +202,11 @@ class TestCheckContract(GlobalIsolationTestCase):
             "credentials_to_probe",
             "primary_auth_header",
             "username_of",
+            "decode_callback",
+            "note_request",
+            "request_tally",
+            "run_check",
+            "usage_error",
             "load_creds_file",
             "warn_if_world_readable",
             "collect_credentials",
@@ -246,9 +272,11 @@ class TestCrashIsolation(GlobalIsolationTestCase):
         """Run main() with *registered* checks, returning (exit code, stdout, stderr)."""
         out, err = io.StringIO(), io.StringIO()
         code = 0
-        with mock.patch.object(aem_hacker, "registered", registered), mock.patch.object(
-            sys, "argv", ["aem_hacker.py"] + argv
-        ), mock.patch.object(
+        with mock.patch.object(
+            aem_hacker,
+            "registered",
+            {k: with_liveness(v) for k, v in registered.items()},
+        ), mock.patch.object(sys, "argv", ["aem_hacker.py"] + argv), mock.patch.object(
             aem_hacker, "preflight", lambda *a, **k: True
         ), mock.patch.object(
             aem_hacker, "run_detector", lambda p: mock.Mock()
@@ -353,7 +381,7 @@ class TestCrashIsolation(GlobalIsolationTestCase):
                 snapshot.setdefault("output_after_first_result", buf.getvalue())
 
         with mock.patch.object(
-            aem_hacker, "registered", {"good": good}
+            aem_hacker, "registered", {"good": with_liveness(good)}
         ), mock.patch.object(
             sys, "argv", ["aem_hacker.py", "-u", "http://x", "--host", "1.2.3.4"]
         ), mock.patch.object(
@@ -447,7 +475,11 @@ class TestExitStatusHonesty(GlobalIsolationTestCase):
     def _run_main(self, registered, argv=None):
         out, err = io.StringIO(), io.StringIO()
         code = 0
-        with mock.patch.object(aem_hacker, "registered", registered), mock.patch.object(
+        with mock.patch.object(
+            aem_hacker,
+            "registered",
+            {k: with_liveness(v) for k, v in registered.items()},
+        ), mock.patch.object(
             sys, "argv", ["aem_hacker.py"] + (argv or [])
         ), mock.patch.object(
             aem_hacker, "preflight", lambda *a, **k: True
@@ -1253,6 +1285,203 @@ class TestCveCoverageDoc(GlobalIsolationTestCase):
             )
 
 
+class TestSsrfCallbackTrust(GlobalIsolationTestCase):
+    """A callback is only trusted if it names a URL this check asked for.
+
+    The correlation token is disclosed to every target the scanner touches (it is
+    part of the outbound URL) and the listener binds 0.0.0.0, so the target itself
+    can seed the store. An empty segment also base16-decodes successfully, which
+    produced a finding with a blank URL for a target with no SSRF at all.
+    """
+
+    def test_empty_callback_is_rejected(self):
+        self.assertIsNone(aem_hacker.decode_callback("", "http://target"))
+
+    def test_non_base16_callback_is_rejected(self):
+        self.assertIsNone(aem_hacker.decode_callback("not-hex!!", "http://target"))
+
+    def test_callback_naming_another_origin_is_rejected(self):
+        import base64
+
+        forged = base64.b16encode(b"http://evil.example.com/x").decode()
+        self.assertIsNone(
+            aem_hacker.decode_callback(forged, "http://target"),
+            "a foreign URL was accepted",
+        )
+
+    def test_our_own_callback_is_accepted(self):
+        import base64
+
+        ours = base64.b16encode(b"http://target/libs/x.json?path=http://cb/").decode()
+        self.assertEqual(
+            aem_hacker.decode_callback(ours, "http://target"),
+            "http://target/libs/x.json?path=http://cb/",
+        )
+
+    def test_forged_callback_produces_no_finding(self):
+        """End to end: a peer seeds the store with junk; the report stays empty."""
+        import requests
+
+        def forged_route(method, path, headers):
+            return b"<html>404</html>"
+
+        aem_hacker.d = {}
+        aem_hacker.token = "TOK"
+        with MockAEM(routes=[Route(r".*", body=forged_route)]) as target:
+            detector_port = free_port()
+            httpd = aem_hacker.run_detector(detector_port)
+            try:
+                # Exactly what a hostile target would do: it saw the token in the
+                # URL we sent it and posted a junk callback back.
+                requests.get(
+                    "http://127.0.0.1:{0}/TOK/salesforcesecret/".format(detector_port),
+                    timeout=5,
+                )
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    findings = run_handler(
+                        aem_hacker.registered["salesforcesecret_servlet"],
+                        target,
+                        my_host="127.0.0.1:{0}".format(detector_port),
+                    )
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        self.assertEqual(findings, [], "a forged SSRF callback produced a finding")
+
+
+class TestListenerBounds(GlobalIsolationTestCase):
+    """The callback store is reachable by an unauthenticated peer.
+
+    The listener binds 0.0.0.0 and the correlation token is disclosed to every
+    target the scanner touches, so a peer can send arbitrary paths. Capping the
+    values per key is not enough on its own; the key count and key length need
+    bounds too, or `d` grows without limit.
+    """
+
+    def _detector(self, store):
+        detector = aem_hacker.Detector.__new__(aem_hacker.Detector)
+        detector.d = store
+        detector.token = "T"
+        return detector
+
+    def test_key_count_is_bounded(self):
+        store = {}
+        detector = self._detector(store)
+        for i in range(detector.max_keys * 4):
+            detector.record("key{0}".format(i), "v")
+        self.assertLessEqual(
+            len(store), detector.max_keys, "an unauthenticated peer grew d unbounded"
+        )
+
+    def test_values_per_key_are_bounded(self):
+        store = {}
+        detector = self._detector(store)
+        for i in range(detector.max_values_per_key * 4):
+            detector.record("same", "v{0}".format(i))
+        self.assertEqual(len(store["same"]), detector.max_values_per_key)
+
+    def test_an_absurdly_long_key_is_rejected(self):
+        store = {}
+        detector = self._detector(store)
+        self.assertFalse(detector.record("k" * (detector.max_key_length + 1), "v"))
+        self.assertEqual(store, {})
+
+    def test_a_normal_callback_is_recorded(self):
+        store = {}
+        detector = self._detector(store)
+        self.assertTrue(detector.record("salesforcesecret", "abc"))
+        self.assertEqual(store["salesforcesecret"], ["abc"])
+
+
+class TestExitCodeContract(GlobalIsolationTestCase):
+    """0 clean / 1 found / 2 incomplete / 3 could not scan."""
+
+    def _run(self, argv, registered=None, liveness=True):
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with mock.patch.object(
+            aem_hacker,
+            "registered",
+            {
+                k: (with_liveness(v) if liveness else v)
+                for k, v in (registered or {}).items()
+            },
+        ), mock.patch.object(sys, "argv", ["aem_hacker.py"] + argv), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), mock.patch.object(
+            aem_hacker, "run_detector", lambda p: None
+        ), mock.patch.object(
+            aem_hacker.time, "sleep", no_sleep
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            try:
+                code = aem_hacker.main() or 0
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, out.getvalue(), err.getvalue()
+
+    def test_usage_failures_are_not_reported_as_findings(self):
+        cases = [
+            [],  # no -u
+            ["-u", "http://x", "--handler", "nope"],  # unknown handler
+            ["-u", "http://x", "--host", "1.2.3.4", "--creds", "malformed"],
+            ["-u", "http://x", "--host", "1.2.3.4", "-H", "nocolon"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                code, _, _ = self._run(argv)
+                self.assertEqual(
+                    code,
+                    3,
+                    f"{argv} exited {code}; 1 would claim a finding was made",
+                )
+
+    def test_a_dead_target_is_not_a_clean_scan(self):
+        """A check whose every request failed must not read as clean.
+
+        Checks swallow their own exceptions, so this returns [] exactly like a
+        clean result; only the request tally distinguishes them.
+        """
+        dead_target = "http://127.0.0.1:1"
+
+        def dead_check(base_url, my_host, debug=False, proxy=None):
+            for _ in range(2):
+                try:
+                    aem_hacker.http_request(dead_target + "/x")
+                except Exception:
+                    pass
+            return []
+
+        code, _, err = self._run(
+            ["-u", dead_target, "--host", "1.2.3.4"],
+            registered={"dead": dead_check},
+            liveness=False,
+        )
+        self.assertEqual(code, 2, "a check with no successful request read as clean")
+        self.assertIn("no successful request", err)
+
+    def test_a_check_that_reaches_the_target_still_exits_zero(self):
+        """The rule must not fire on a check that simply found nothing."""
+        with MockAEM() as target:
+
+            def quiet_check(base_url, my_host, debug=False, proxy=None):
+                try:
+                    aem_hacker.http_request(base_url + "/.children.json")
+                except Exception:
+                    pass
+                return []
+
+            code, _, err = self._run(
+                ["-u", target.url, "--host", "1.2.3.4"],
+                registered={"quiet": quiet_check},
+            )
+        self.assertEqual(code, 0, f"a clean check was flagged: {err}")
+
+
 class TestSlurper(GlobalIsolationTestCase):
     """aem_slurper.py must not confuse "could not read" with "nothing there".
 
@@ -1646,7 +1875,7 @@ class TestHelpers(GlobalIsolationTestCase):
         self.assertEqual(aem_hacker.extra_headers.get("X-A"), "a:b:c")
 
     def test_malformed_header_is_rejected(self):
-        buf = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(
             sys,
             "argv",
@@ -1659,10 +1888,11 @@ class TestHelpers(GlobalIsolationTestCase):
                 "--header",
                 "nocolon",
             ],
-        ), contextlib.redirect_stdout(buf):
-            with self.assertRaises(SystemExit):
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
                 aem_hacker.main()
-        self.assertIn("nocolon", buf.getvalue())
+        self.assertEqual(ctx.exception.code, aem_hacker.EXIT_USAGE)
+        self.assertIn("nocolon", out.getvalue() + err.getvalue())
 
 
 if __name__ == "__main__":
