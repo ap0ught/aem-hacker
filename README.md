@@ -57,7 +57,8 @@ Following checks are currently implemented:
 usage: aem_hacker.py [-h] [-u URL] [--proxy PROXY] [--debug] [--host HOST]
                      [--port PORT] [--workers WORKERS]
                      [-H [HEADER [HEADER ...]]] [--handler HANDLER]
-                     [--listhandlers]
+                     [--listhandlers] [--delay DELAY] [--ssrf-timeout SSRF_TIMEOUT]
+                     [--creds USER:PASS] [--format {text,json}] [--output OUTPUT]
 
 AEM hacker by @0ang3el, see the slides -
 https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps
@@ -76,7 +77,97 @@ optional arguments:
   --handler HANDLER     run specific handlers, if omitted run all handlers
   --listhandlers        list available handlers
   --delay DELAY         seconds between requests
+  --ssrf-timeout SSRF_TIMEOUT
+                        seconds to wait for SSRF callbacks to arrive
+  --creds-file PATH     read credentials from a file, one 'user:password' per
+                        line; preferred, keeps the password off the command line
+  --creds USER:PASS     credential for checks that need an authenticated
+                        session; repeatable
+  --format {text,json}  output format; 'json' is one finding per line
+  --strict              skip checks marked experimental (see below)
+  --output OUTPUT       write the report to a file instead of stdout
+
+Findings are printed as each check finishes, and the exit status is meaningful so
+the tool composes in a pipeline:
+
+| Exit | Meaning |
+|---|---|
+| `0` | clean — every selected check reached the target and found nothing |
+| `1` | something was found |
+| `2` | the scan did **not** complete: a check crashed, a check never reached the target, or it was interrupted |
+| `3` | the scan could not start: bad arguments, unknown handler, or an unreachable URL |
+
+`3` exists so that `|| echo "something was found"` cannot fire for a typo or a
+dead host. "I could not scan this" and "this is vulnerable" are the two facts a
+consumer of this tool most needs to keep apart.
+
+Exit `2` exists so a failed or truncated scan is never mistaken for a clean bill
+of health:
+
+
 ```
+aem_hacker.py -u https://aem.webapp --format json --output findings.json || echo "something was found"
+```
+
+(The usage block above is abridged for readability — `aem_hacker.py -h` is
+authoritative.)
+
+**Behaviour changes on this branch** (relative to `master`): exit status is now
+`0` clean / `1` found / `2` incomplete / `3` could-not-scan; `--delay N` now means
+`N` rather than `2N`; and roughly half as many HTTP requests are sent, because a
+warm-up request per URL and a fresh TLS handshake per request are gone. No check
+was added to or removed from the default sweep — see
+[opt-in checks](#opt-in-checks) below.
+
+**Authenticated checks (`--creds`).** Most AEM CVEs are low-privilege or
+require user interaction, so an anonymous scanner structurally cannot detect
+them — APSB22-59 alone lists ~35 such issues. Pass a credential and the checks
+that Adobe rates `PR:L` (the AEM Forms/TouchUI XSS checks, the login-page open
+redirect) and the authenticated product-info probe will send it:
+
+```
+python3 aem_hacker.py -u https://aem.webapp --host your_vps --creds author:author
+```
+
+Because a password on the command line is visible in `ps`, `/proc/*/cmdline`
+and shell history, there are two routes that keep it off the command line:
+
+```
+printf 'author:letmein\n' > ~/.aem-creds && chmod 600 ~/.aem-creds
+python3 aem_hacker.py -u https://aem.webapp --creds-file ~/.aem-creds
+# or:
+AEM_HACKER_CREDS='author:letmein' python3 aem_hacker.py -u https://aem.webapp
+```
+
+`--creds-file` takes one `user:password` per line (`#` comments and blank lines
+allowed) and warns if the file is readable by other users. All three sources
+combine, and supplied credentials are *added to* the built-in default list rather
+than replacing it.
+
+The password *value* is never written to a finding, to stdout, or to an error
+message; only the username is reported. Two rejection messages disclose the
+password's *length* rather than its content, so a mistyped value can be
+diagnosed without printing it. With no credential flags at all, every check
+behaves exactly as before. Only the first
+credential is used for session-style probes, so supplying more does not multiply
+the request count; the default-credential checks try all of them in place of
+their built-in list.
+
+**Opt-in checks.** `currentuser_servlet` and `reports` are reachable but not part
+of a plain run — the maintainer deliberately took both out of the default sweep
+(see [CVE_COVERAGE.md](CVE_COVERAGE.md#-provenance-and-audit-status)). A plain run
+prints what it left out; run one explicitly with `--handler currentuser_servlet`
+or `--handler reports`.
+
+**Experimental checks.** Five of the checks carry CVE numbers that an audit
+found to be wrong: CVE-2023-38205 is an Adobe *ColdFusion* issue, CVE-2021-40722
+is an XXE rather than an SSRF, CVE-2021-36063 is *Adobe Connect*, CVE-2022-30679
+ships in a different bulletin than its sibling, and the AEM open redirect is
+CVE-2023-29307 (3.5 Low, not CVE-2023-29297 at 6.1). The techniques those checks
+probe are real, but their detection logic has never been validated against a live
+AEM. Findings from them are prefixed `[UNVERIFIED CHECK]`, and `--strict` skips
+them entirely. The full audit, with vendor bulletin citations, is in
+[CVE_COVERAGE.md](CVE_COVERAGE.md#-provenance-and-audit-status).
 
 #### Example
 ```
@@ -88,6 +179,38 @@ or
 ```
 python3 aem_hacker.py -u https://aem.webapp --host your_vps_hostname_ip --handler groovy_console --handler salesforcesecret_servlet
 
+```
+
+## Tests
+
+The scanner has a dependency-free test suite (stdlib `unittest` plus a mock AEM
+target) covering the request layer, the SSRF callback listener, the CLI, the
+sibling scripts, and the contract that every registered check is reachable and
+safe to run. It runs in CI on every push and pull request:
+
+```
+./tests/run_tests.sh
+python3 tests/bench.py HEAD    # compare request/connection/wall-time cost against a revision
+```
+
+## aem_enum.py
+
+Enumerates usernames and secret-looking nodes from an AEM webapp whose JCR tree
+is exposed via `DefaultGetServlet`. It walks the JCR tree, collecting any
+attribute whose key ends in `By` (e.g. `jcr:createdBy`, `cq:lastModifiedBy`) as a
+username hint, and any child node matching a credential-ish pattern (passwords,
+credentials, `*.key`, `*.pem`, config/backup archives) as a URL worth fetching.
+Results go to a `|`-delimited CSV.
+
+Requires `dpath`, which is an optional extra:
+
+```
+pip install -r requirements-enum.txt
+```
+
+#### Usage
+```
+python3 aem_enum.py --url https://aem.webapp --out findings.csv --maxdepth 6
 ```
 
 ## aem_discoverer.py

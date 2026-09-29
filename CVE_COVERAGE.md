@@ -24,7 +24,131 @@ check you will find:
 
 ---
 
+## ⚠️ Provenance and audit status
+
+**Two checks were documented as implemented but were unreachable.**
+`currentuser_servlet` and `reports` had their `@register` decorator commented out,
+so the README claimed them while they could never run. They are registered again
+and documented below — but as **opt-in**, and the reason matters:
+
+| | date | what |
+|---|---|---|
+| `ByQwert` added both, enabled | 2019-03-16 | `b65466a` |
+| `0ang3el` commented both out | 2020-01-03 | `0dbb87d` "Tooling update" — in the same commit that registered four *other* checks |
+
+So this was not an accident. `currentuser_servlet` brute-forces credentials, which
+its two neighbours `loginstatus_servlet` and `userinfo_servlet` already do and
+which stayed enabled — the author kept two of the three, which reads as a
+deliberate de-duplication. `reports` is low-value information disclosure.
+
+**The defect was therefore in the documentation, not the code.** Claiming three
+checks where the author ships two is wrong; silently re-adding the third to the
+default sweep would override the maintainer's judgement. Both are now registered,
+listed by `--listhandlers`, documented here, and runnable with
+`--handler <name>` — but excluded from a plain run, which also announces what it
+left out. Re-enabling them by default is a one-line change
+(`@register(..., default=True)`) if you disagree with the de-duplication.
+
+A regression test now fails if any check becomes unreachable, another fails if
+this document and the code disagree about which checks exist, and a third pins
+that these two stay opt-in.
+
+**Every CVE attribution in the five checks added by the Copilot PRs was wrong.**
+Each was checked against the vendor bulletin it cited, and in all five cases the
+CVE belongs to a different product, a different vulnerability class, a different
+bulletin, or a different severity:
+
+| Handler | Claimed | Actually |
+|---|---|---|
+| `ssrf_cve_2021_40722` | SSRF, 7.5 High, APSB21-99 | **XXE → RCE, 9.8 Critical, [APSB21-103](https://helpx.adobe.com/security/products/experience-manager/apsb21-103.html)**. AEM 6.5.10.0 and earlier. Detected by submitting external-entity XML, which this check does not do. The nearest AEM SSRF is CVE-2021-28627 (APSB21-39, 5.4, **PR:L** — not unauthenticated). |
+| `auth_bypass_cve_2023_38205` | AEM auth bypass, 9.8, APSB23-43 | **CVE-2023-38205 is Adobe _ColdFusion_** ([APSB23-47](https://helpx.adobe.com/security/products/coldfusion/apsb23-47.html)), improper access control, **7.5**, a *double-dot* bypass — nothing to do with AEM. [APSB23-43](https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html) is an AEM bulletin but covers reflected XSS (CVE-2023-38214/38215, 5.4). The bypass this check actually probes is real but **has no CVE** (Detectify, 2021). |
+| `xss_aem_forms` | AEM Forms reflected XSS, CVE-2021-36063, APSB21-77 | **CVE-2021-36063 is Adobe _Connect_** ([APSB21-66](https://helpx.adobe.com/security/products/connect/apsb21-66.html)), 11.2.2 and earlier. Not an AEM issue. The AEM Forms XSS issues are the APSB21-103 family (CVE-2021-44178 reflected; CVE-2021-43761/43764 stored). |
+| `xss_reflected_cve_2022` | CVE-2022-30677 / -30679, both APSB22-40, 6.1 | The two CVEs are in **different bulletins**: CVE-2022-30677 is [APSB22-40](https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html), CVE-2022-30679 is [APSB22-59](https://helpx.adobe.com/security/products/experience-manager/apsb22-59.html). Both are **5.4**, not 6.1, and both are **PR:L / UI:R** — they need a low-privilege authenticated user and user interaction, so an anonymous probe cannot establish that an instance is CVE-affected. |
+| `open_redirect` | AEM open redirect, CVE-2023-29297, 6.1 | **CVE-2023-29297 is Adobe _Commerce / Magento_** (template injection, [APSB23-35](https://helpx.adobe.com/security/products/magento/apsb23-35.html)). AEM's login-page open redirect is **CVE-2023-29307** ([APSB23-31](https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html)), rated **3.5 Low**, and also **PR:L / UI:R**. |
+
+**What this means for these five checks.** The *techniques* they probe are real
+AEM weakness classes. The CVE numbers, severities and preconditions are not. None
+of the five has been validated to true-positive against a genuinely vulnerable
+AEM, and a clean result does not mean the instance is unaffected. They are
+therefore marked `experimental`:
+
+* they still run by default, but every finding they produce is prefixed
+  **`[UNVERIFIED CHECK]`** so a report cannot present them as confirmed;
+* `--strict` skips them entirely, for when you want only checks whose detection
+  logic has been validated.
+
+The handler names still contain the old CVE numbers, because renaming them would
+break `--handler` for existing scripts. The names are historical; the audit notes
+in each function's docstring give the correct attribution.
+
+---
+
+## 🔑 Authenticated checks (`--creds`)
+
+Most AEM CVEs are **low-privilege (`PR:L`) or require user interaction
+(`UI:R`)**, which an unauthenticated scanner cannot detect. APSB22-59 is a good
+illustration: roughly 35 CVEs, almost all stored/reflected XSS at `PR:L/UI:R`.
+Before `--creds` existed this tool could not meaningfully check any of them, and
+an anonymous "XSS check" for such a CVE can only ever show the reflection
+primitive.
+
+```
+python3 aem_hacker.py -u https://aem.webapp --host your_vps --creds author:author
+```
+
+A password on the command line is visible in `ps`, `/proc/*/cmdline` and shell
+history, so two off-the-command-line routes are also accepted — they combine
+with `--creds`:
+
+```
+chmod 600 ~/.aem-creds          # one 'user:password' per line
+python3 aem_hacker.py -u https://aem.webapp --creds-file ~/.aem-creds
+AEM_HACKER_CREDS='author:letmein' python3 aem_hacker.py -u https://aem.webapp
+```
+
+`--creds-file` warns when the file is readable by other users. A credential
+outside ISO-8859-1 is rejected, because RFC 7617 Basic authentication cannot
+transmit it (and UTF-8 would send mojibake that silently never validates).
+
+Which checks use it:
+
+| Check | Without `--creds` | With `--creds` |
+|---|---|---|
+| `xss_aem_forms`, `xss_reflected_cve_2022`, `open_redirect` | anonymous | sends the credential — the `PR:L` case Adobe actually describes |
+| `loginstatus_servlet`, `userinfo_servlet`, `currentuser_servlet` | tries the built-in default-credential list | tries the built-in list **plus** the supplied credentials |
+| `version_disclosure` (product-info probe) | `admin:admin`, as it always has | sends the supplied credential |
+
+Properties worth knowing:
+
+* With no `--creds`, the credential checks probe **the same set of credentials
+  as before** and the anonymous path is unchanged. No check is new to the default
+  sweep: `currentuser_servlet` and `reports` are reachable but opt-in, as the
+  maintainer intended.
+* Supplied credentials are **added to** the built-in default-credential list, not
+  substituted for it — using `--creds` to reach a `PR:L` check does not silently
+  disable "AEM with default credentials" detection.
+* Only the **first** credential is used for session-style probes, so supplying
+  several does not multiply the request count. The default-credential checks try
+  all of them in place of their built-in list.
+* The password **value** is never written to a finding, to stdout, or to an error
+  message; only the username is reported. Two rejection messages disclose its
+  *length* rather than its content.
+* CR, LF and NUL are rejected in a credential, because the value is interpolated
+  into an HTTP header and one that could terminate the header would allow request
+  smuggling.
+
+**Verified as correct** (spot-checked against their vendor bulletins):
+CVE-2019-8086/9.8, CVE-2016-7882/6.1, CVE-2018-5006/7.5, CVE-2018-12809/7.5,
+CVE-2015-1833/9.1 — the upstream checks from @0ang3el.
+
+---
+
 ## Quick-Reference Table
+
+`⚠` marks an **experimental** check: its detection logic is unvalidated and its
+CVE attribution was corrected during audit — see
+[Provenance and audit status](#-provenance-and-audit-status). Scores marked
+"est." are internal estimates, not vendor ratings.
 
 | # | Handler | CVE | CVSS | Rating | Vuln Class |
 |---|---------|-----|------|--------|------------|
@@ -39,6 +163,8 @@ check you will find:
 | 9 | `create_new_nodes2` | — | ~8.8 | High | Persistent XSS / RCE |
 | 10 | `loginstatus_servlet` | — | ~9.8 | Critical | Auth Bypass / Credential Brute-force |
 | 11 | `userinfo_servlet` | — | ~7.5 | High | Info Disclosure / Credential Brute-force |
+| 11b | `currentuser_servlet` | — | ~7.5 | High | Info Disclosure / Credential Brute-force |
+| 11c | `reports` | — | ~5.3 | Medium | Info Disclosure |
 | 12 | `felix_console` | — | ~9.8 | Critical | RCE |
 | 13 | `wcmdebug_filter` | CVE-2016-7882 | 6.1 | Medium | Reflected XSS |
 | 14 | `wcmsuggestions_servlet` | — | ~6.1 | Medium | Reflected XSS |
@@ -55,11 +181,11 @@ check you will find:
 | 25 | `groovy_console` | — | ~9.8 | Critical | RCE |
 | 26 | `acs_tools` | — | ~9.8 | Critical | RCE |
 | 27 | `version_disclosure` | — | ~5.3 | Medium | Info Disclosure (Hardening) |
-| 28 | `open_redirect` | CVE-2023-29297 | 6.1 | Medium | Open Redirect |
-| 29 | `auth_bypass_cve_2023_38205` | CVE-2023-38205 | 9.8 | Critical | Auth Bypass → RCE |
-| 30 | `xss_aem_forms` | CVE-2021-36063 | 6.1 | Medium | Reflected XSS |
-| 31 | `xss_reflected_cve_2022` | CVE-2022-30677 / CVE-2022-30679 | 6.1 | Medium | Reflected XSS |
-| 32 | `ssrf_cve_2021_40722` | CVE-2021-40722 | 7.5 | High | SSRF |
+| 28 | `open_redirect` ⚠ | CVE-2023-29307 (APSB23-31) | 3.5 | Low | Open Redirect |
+| 29 | `auth_bypass_cve_2023_38205` ⚠ | — (no CVE; Detectify 2021) | ~8.8 est. | High | Auth Bypass → RCE |
+| 30 | `xss_aem_forms` ⚠ | — (no CVE) | ~6.1 est. | Medium | Reflected XSS |
+| 31 | `xss_reflected_cve_2022` ⚠ | CVE-2022-30677 (APSB22-40) / CVE-2022-30679 (APSB22-59) | 5.4 | Medium | Reflected XSS |
+| 32 | `ssrf_cve_2021_40722` ⚠ | — (not CVE-2021-40722) | ~7.5 est. | High | SSRF |
 
 ---
 
@@ -400,6 +526,80 @@ curl -sk 'https://TARGET/libs/cq/security/userinfo.json' \
   -H 'Authorization: Basic YWRtaW46YWRtaW4='
 
 # A non-anonymous "userID" field in the response confirms access
+```
+
+---
+
+### 11b · `currentuser_servlet` — Exposed CurrentUserServlet (Credential Brute-force)
+
+| Field | Value |
+|-------|-------|
+| Finding name | `CurrentUserServlet` / `AEM with default credentials` |
+| Vulnerability class | Information Disclosure / Authentication Weakness |
+| CVE | — (misconfiguration) |
+| CVSS | ~7.5 (High) |
+| Affected versions | AEM 6.x |
+
+> **Opt-in, not in the default sweep.** Its `@register` decorator was commented
+> out, so the README listed it as implemented while it could never run. It is
+> registered again and covered by tests, but deliberately left out of a plain
+> run: `loginstatus_servlet` and `userinfo_servlet` already perform this
+> brute-force and the author kept two of the three. Run it with
+> `--handler currentuser_servlet`.
+
+**Why it exists**
+`/libs/granite/security/currentuser.json` returns the authenticated principal's
+ID. When reachable anonymously it is a credential oracle: usable usernames can be
+harvested from `jcr:createdBy` / `cq:lastModifiedBy` on any JCR node, and each
+default password can be confirmed in one request.
+
+A login counts as successful only when the response is a 200 **and** names a
+non-anonymous principal. An earlier version tested merely for the absence of the
+string `anonymous`, which reported working default credentials on every 401/403
+and error page.
+
+**Manual curl test**
+
+```bash
+# Unauthenticated probe
+curl -sk 'https://TARGET/libs/granite/security/currentuser.json'
+
+# Credential confirmation
+curl -sk 'https://TARGET/libs/granite/security/currentuser.json' \
+  -H 'Authorization: Basic YWRtaW46YWRtaW4='
+
+# "authorizableId":"admin" confirms the default credential works
+```
+
+---
+
+### 11c · `reports` — Exposed AEM Reports (Information Disclosure)
+
+| Field | Value |
+|-------|-------|
+| Finding name | `Reports` |
+| Vulnerability class | Information Disclosure |
+| CVE | — (misconfiguration) |
+| CVSS | ~5.3 (Medium) |
+| Affected versions | AEM 6.x |
+
+> **Opt-in, not in the default sweep**, for the same reason as
+> `currentuser_servlet`: its `@register` decorator was commented out while the
+> README still claimed it. Run it with `--handler reports`.
+
+**Why it exists**
+The reporting endpoints under `/libs/granite/content/reports` and the classic
+`/cq/reports` path expose operational data — user activity, audit trails,
+inventory and usage statistics — that is not meant to be publicly readable and
+often aggregates internal usernames and system details.
+
+**Manual curl test**
+
+```bash
+curl -sk 'https://TARGET/libs/granite/content/reports.json'
+curl -sk 'https://TARGET/cq/reports.json'
+
+# A 200 with a JSON reports document confirms exposure
 ```
 
 ---
@@ -874,16 +1074,28 @@ curl -sk 'https://TARGET/system/console/productinfo' \
 
 ---
 
-### 28 · `open_redirect` — Open Redirect via Login Page Resource Parameter (CVE-2023-29297)
+### 28 · `open_redirect` — Open Redirect via Login Page Resource Parameter ⚠ experimental
 
 | Field | Value |
 |-------|-------|
 | Finding name | `OpenRedirect` |
-| Vulnerability class | Open Redirect |
-| CVE | **CVE-2023-29297** |
-| CVSS v3.1 | **6.1 (Medium)** |
+| Vulnerability class | Open Redirect (CWE-601) |
+| CVE | **CVE-2023-29307** (AEM) — *not* CVE-2023-29297, which is Adobe Commerce |
+| CVSS v3.1 | **3.5 (Low)**, `AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:N/A:N` |
 | Affected versions | AEM 6.5.16.0 and earlier |
 | Adobe bulletin | [APSB23-31](https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html) |
+
+> **Reachable with `--creds`.** Adobe rates this `PR:L / UI:R`, so the check
+> only probes the authenticated case when a credential is supplied. See
+> [Authenticated checks](#-authenticated-checks-creds).
+>
+> **Audit correction.** This entry previously claimed CVE-2023-29297 at 6.1
+> Medium, unauthenticated. CVE-2023-29297 is an Adobe **Commerce / Magento**
+> template-injection issue (APSB23-35), not AEM. AEM's login-page open redirect
+> is CVE-2023-29307, rated **3.5 Low** and **PR:L / UI:R** — it needs a
+> low-privilege *authenticated* user. The check below is anonymous-only, so it
+> can at most show a wider misconfiguration, and a clean result does not mean
+> the instance is unaffected.
 
 **Why it exists**
 The AEM login page accepts a `resource` query parameter to redirect users after
@@ -904,16 +1116,27 @@ curl -skI \
 
 ---
 
-### 29 · `auth_bypass_cve_2023_38205` — Auth Bypass via Double-Slash Dispatcher (CVE-2023-38205)
+### 29 · `auth_bypass_cve_2023_38205` — Auth Bypass via Dispatcher Filter-Bypass Paths ⚠ experimental
 
 | Field | Value |
 |-------|-------|
 | Finding name | `AuthBypassFelixConsole` / `AuthBypassCRX` |
 | Vulnerability class | Authentication Bypass → Remote Code Execution |
-| CVE | **CVE-2023-38205** |
-| CVSS v3.1 | **9.8 (Critical)** |
-| Affected versions | AEM 6.5.17.0 and earlier |
-| Adobe bulletin | [APSB23-43](https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html) |
+| CVE | **none** — the handler name is historical; see audit note |
+| CVSS v3.1 | ~8.8 (High, *internal estimate* — no vendor score exists) |
+| Affected versions | AEM versions where the dispatcher filter is not normalised |
+| Reference | [Detectify, undocumented authentication bypass in AEM Package Manager (2021)](https://labs.detectify.com/writeups/undocumented-authentication-bypass-issue-in-aem-package-manager-blog-updated/) |
+
+> **Audit correction.** This entry previously claimed **CVE-2023-38205 at 9.8
+> Critical** under **APSB23-43**. Both were wrong:
+> * **CVE-2023-38205 is Adobe _ColdFusion_**, not AEM — improper access
+>   control, **7.5**, fixed in [APSB23-47](https://helpx.adobe.com/security/products/coldfusion/apsb23-47.html),
+>   and the bypass is a *double-dot* sequence (`/hax/..CFIDE/...`).
+> * **APSB23-43** *is* an AEM bulletin, but it covers **reflected XSS**
+>   (CVE-2023-38214 / CVE-2023-38215, 5.4), not this bypass.
+>
+> The technique this check probes is real and separately disclosed, but it has
+> **no CVE** — hence the "no CVE" row above rather than a fabricated number.
 
 **Why it exists**
 The AEM Dispatcher normalises URL paths before applying access-control rules.
@@ -939,16 +1162,28 @@ Reference: <https://labs.detectify.com/writeups/undocumented-authentication-bypa
 
 ---
 
-### 30 · `xss_aem_forms` — Reflected XSS in AEM Forms (CVE-2021-36063)
+### 30 · `xss_aem_forms` — Reflected XSS in AEM Forms Endpoints ⚠ experimental
 
 | Field | Value |
 |-------|-------|
 | Finding name | `XSS in AEM Forms` |
 | Vulnerability class | Reflected Cross-Site Scripting (XSS) |
-| CVE | **CVE-2021-36063** |
-| CVSS v3.1 | **6.1 (Medium)** |
-| Affected versions | AEM Forms 6.5.10.0 and earlier |
-| Adobe bulletin | [APSB21-77](https://helpx.adobe.com/security/products/experience-manager/apsb21-77.html) |
+| CVE | **none** — not CVE-2021-36063; see audit note |
+| CVSS v3.1 | ~6.1 (*internal estimate*) |
+| Affected versions | AEM 6.x, depends on configuration |
+| Adobe bulletin | — (AEM Forms XSS of this era: [APSB21-103](https://helpx.adobe.com/security/products/experience-manager/apsb21-103.html)) |
+
+> **Reachable with `--creds`.** The genuine AEM Forms XSS issues require a
+> low-privilege authenticated user; pass `--creds` to probe that case.
+>
+> **Audit correction.** This entry previously claimed **CVE-2021-36063**
+> (APSB21-77). CVE-2021-36063 is a reflected XSS in **Adobe _Connect_** 11.2.2
+> and earlier ([APSB21-66](https://helpx.adobe.com/security/products/connect/apsb21-66.html)),
+> and has nothing to do with AEM Forms. The genuine AEM Forms XSS issues in that
+> period are the APSB21-103 family — CVE-2021-44178 (reflected, PR:N/UI:R) and
+> CVE-2021-43761 / CVE-2021-43764 (stored, PR:L). This check tests only the
+> generic "an AEM Forms path echoes a query parameter unencoded" behaviour and
+> is not a check for any specific CVE.
 
 **Why it exists**
 AEM Forms component endpoints under `/content/forms/af` and
@@ -968,16 +1203,25 @@ curl -sk \
 
 ---
 
-### 31 · `xss_reflected_cve_2022` — Reflected XSS in AEM TouchUI (CVE-2022-30677 / CVE-2022-30679)
+### 31 · `xss_reflected_cve_2022` — Reflected XSS in AEM TouchUI ⚠ experimental
 
 | Field | Value |
 |-------|-------|
 | Finding name | `XSS in AEM TouchUI` |
 | Vulnerability class | Reflected Cross-Site Scripting (XSS) |
-| CVE | **CVE-2022-30677** / **CVE-2022-30679** |
-| CVSS v3.1 | **6.1 (Medium)** |
-| Affected versions | AEM 6.5.13.0 and earlier |
-| Adobe bulletin | [APSB22-40](https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html) |
+| CVE | **CVE-2022-30677** ([APSB22-40](https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html)) / **CVE-2022-30679** ([APSB22-59](https://helpx.adobe.com/security/products/experience-manager/apsb22-59.html)) |
+| CVSS v3.1 | **5.4 (Medium)** for both, `AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N` |
+| Affected versions | 6.5.13.0 and earlier (-30677); 6.5.14.0 and earlier (-30679) |
+
+> **Reachable with `--creds`.** Both CVEs are `PR:L / UI:R`; without a
+> credential the probe can only show the reflection primitive.
+>
+> **Audit correction.** This entry previously listed **6.1** and cited APSB22-40
+> for *both* CVEs. The two ship in **different bulletins** — CVE-2022-30679 is in
+> **APSB22-59**, not APSB22-40 — and Adobe rates both **5.4**, with
+> **`PR:L / UI:R`**. They require a low-privilege authenticated user and user
+> interaction, so the anonymous probe below demonstrates the reflection primitive
+> but cannot establish that an instance is CVE-affected.
 
 **Why it exists**
 AEM's TouchUI shell and workflow console components at
@@ -998,16 +1242,27 @@ curl -sk \
 
 ---
 
-### 32 · `ssrf_cve_2021_40722` — Unauthenticated SSRF via Content-Sync Endpoint (CVE-2021-40722)
+### 32 · `ssrf_cve_2021_40722` — SSRF via Content-Sync / Replication Endpoint ⚠ experimental
 
 | Field | Value |
 |-------|-------|
-| Finding name | `SSRF CVE-2021-40722` |
+| Finding name | `SSRF (unverified CVE attribution)` |
 | Vulnerability class | Server-Side Request Forgery (SSRF) |
-| CVE | **CVE-2021-40722** |
-| CVSS v3.1 | **7.5 (High)** |
-| Affected versions | AEM 6.5.10.0 and earlier (on-premise) |
-| Adobe bulletin | [APSB21-99](https://helpx.adobe.com/security/products/experience-manager/apsb21-99.html) |
+| CVE | **none** — not CVE-2021-40722; see audit note |
+| CVSS v3.1 | ~7.5 (*internal estimate*) |
+| Affected versions | AEM versions exposing the content-sync endpoint |
+| Nearest real CVE | **CVE-2021-28627** ([APSB21-39](https://helpx.adobe.com/security/products/experience-manager/apsb21-39.html)), SSRF, 5.4, **PR:L** — i.e. *not* unauthenticated |
+
+> **Audit correction.** This entry previously claimed an **unauthenticated
+> SSRF**, **CVE-2021-40722**, **7.5 High**, **APSB21-99**. Every part of that was
+> wrong. Per Adobe's own
+> [APSB21-103](https://helpx.adobe.com/security/products/experience-manager/apsb21-103.html),
+> **CVE-2021-40722 is an XXE leading to arbitrary code execution, CVSS 9.8
+> Critical**, in AEM 6.5.10.0 and earlier — not an SSRF, and not APSB21-99. It
+> is detected by submitting external-entity XML, which this check does not do.
+>
+> The content-sync endpoint *does* have a real SSRF, so the check still has
+> value; it just is not this CVE, and the real one requires authentication.
 
 **Why it exists**
 The AEM content-sync replication endpoint at
@@ -1038,8 +1293,32 @@ reproduction steps before sending a PR.
 
 | CVE | Type | Severity | Notes | PSIRT Bulletin |
 |---|---|---|---|---|
-| **CVE-2019-8081** | Auth Bypass | High | Auth bypass in AEM 6.2–6.5; allows unauthenticated access to sensitive JCR content | [APSB19-48](https://helpx.adobe.com/security/products/experience-manager/apsb19-48.html) |
-| **CVE-2023-29298** | Auth Bypass | Critical | Dispatcher bypass via `;%0a` suffix in URL path; the patch was itself bypassed by CVE-2023-38205 | [APSB23-31](https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html) |
+| **CVE-2019-8088** | Command Injection → RCE | **9.8 Critical** | Command injection in AEM 6.2–6.5, `PR:N/UI:N` (CWE-77). Same bulletin, and same reporter, as the CVE-2019-8086 check above. **No public PoC or request path is available** — see the reproduction issue before implementing. | [APSB19-48](https://helpx.adobe.com/security/products/experience-manager/apsb19-48.html) |
+| **CVE-2019-8081** | Auth Bypass | 7.5 High | Authentication bypass leading to sensitive information disclosure in AEM 6.2–6.5, `PR:N/UI:N`. NVD records the CWE as "Insufficient Information"; no public PoC. | [APSB19-48](https://helpx.adobe.com/security/products/experience-manager/apsb19-48.html) |
+| **CVE-2019-8082** | XXE | Important | XML external entity injection in AEM 6.2–6.5, `PR:N`, sensitive information disclosure. Same bulletin as the implemented CVE-2019-8086 check. | [APSB19-48](https://helpx.adobe.com/security/products/experience-manager/apsb19-48.html) |
+
+> These three are the best remaining candidates for this tool: all are
+> unauthenticated with no user interaction, and all three sit in the same
+> bulletin that the existing CVE-2019-8086 check already implements. Note that
+> APSB19-48 credits CVE-2019-8086/8087/8088 to **Mikhail Egorov (@0ang3el)**, this
+> tool's author — of that group, only 8086 is implemented.
+>
+> **CVE-2019-8081 and CVE-2019-8088 are blocked on a reproduction.** Neither
+> Adobe's bulletin nor NVD publishes a request path, and there is no public
+> exploit. Do not guess at a probe: an unauthenticated *command injection* check
+> with no known request shape is not a check. Use the
+> [CVE test reproduction issue template](.github/ISSUE_TEMPLATE/cve-test-reproduction.yml).
+>
+> **Removed during audit: CVE-2023-29298.** This table previously listed it as an
+> AEM dispatcher bypass in APSB23-31, patched incompletely and re-bypassed by
+> CVE-2023-38205. That was the same error as the `auth_bypass_cve_2023_38205`
+> entry above: **CVE-2023-29298 is an Adobe _ColdFusion_** access-control bypass
+> (`/hax/..CFIDE/…`), not an AEM issue. APSB23-31 is an AEM bulletin, but it
+> contains CVE-2023-29304, CVE-2023-29307, CVE-2023-29322 and CVE-2023-29302 —
+> not CVE-2023-29298. The AEM CRX/Felix auth bypass that *is* real has no CVE;
+> Adobe declined to issue one because AEM ships with the relevant controls
+> enabled by default.
+
 
 ### SSRF
 

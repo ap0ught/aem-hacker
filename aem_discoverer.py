@@ -21,6 +21,8 @@ import traceback
 import argparse
 from threading import Lock, Semaphore
 
+import threading
+
 import urllib3
 import requests
 
@@ -62,6 +64,18 @@ def normalize_url(base_url, path):
     return url
 
 
+_local = threading.local()
+
+
+def get_session():
+    """Return this thread's shared :class:`requests.Session`, creating it once."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _local.session = session
+    return session
+
+
 def http_request(url, method="GET", data=None, additional_headers=None, proxy=None):
     """Send an HTTP request and return the response.
 
@@ -75,7 +89,12 @@ def http_request(url, method="GET", data=None, additional_headers=None, proxy=No
 
     if not proxy:
         proxy = {}
-    resp = requests.request(
+
+    # One session per worker thread.  requests.request() builds (and throws
+    # away) a Session per call; with --workers 150 against thousands of URLs
+    # that is a TCP and TLS handshake for every single probe.
+    session = get_session()
+    resp = session.request(
         method,
         url,
         data=data,

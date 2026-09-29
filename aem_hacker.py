@@ -46,12 +46,15 @@ import traceback
 import sys
 import argparse
 import base64
+import os
+import urllib.parse
+import socket
+import threading
 import time
 from collections import namedtuple
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from random import choice, randint
 from string import ascii_letters
-from threading import Thread
 
 import urllib3
 import requests
@@ -78,8 +81,267 @@ registered = {}  # Registered checks
 token = random_string()  # Token to recognize SSRF was triggered
 d = {}  # store SSRF detections
 extra_headers = {}
+credentials = []  # (user, password) pairs supplied via --creds
 
-request_delay = 2
+request_delay = 0
+ssrf_timeout = 10  # seconds to wait for SSRF callbacks to land
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36"
+)
+
+# One session per worker thread.  Building a new Session for every request threw
+# away connection pooling, so each of the thousands of requests a full scan makes
+# paid for a fresh TCP (and TLS) handshake.  Threads are long-lived, so a
+# thread-local keeps connections warm while still isolating cookies per worker.
+_local = threading.local()
+
+
+def get_session():
+    """Return this thread's shared :class:`requests.Session`, creating it once."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _local.session = session
+    return session
+
+
+def note_request(ok):
+    """Record a request outcome for the check currently running on this thread.
+
+    Every check swallows its own exceptions, so a check whose every request was
+    refused returns an empty list and is indistinguishable from a clean one. The
+    tally lets main() tell those apart.
+    """
+    tally = getattr(_local, "requests", None)
+    if tally is not None:
+        tally.append(ok)
+
+
+def request_tally():
+    return getattr(_local, "requests", None)
+
+
+def build_headers(additional_headers=None):
+    """Compose the header set for a request: default UA, per-request extras, then
+    the user-supplied ``-H`` headers, which never override the UA."""
+    headers = {"User-Agent": USER_AGENT}
+    if additional_headers:
+        headers.update(additional_headers)
+    for name, value in extra_headers.items():
+        # Retrieve the headers configured as extra headers but not controlled
+        # by the application in this specific request
+        headers.setdefault(name, value)
+    return headers
+
+
+class CredentialError(ValueError):
+    """Raised when a --creds value cannot be used as a credential."""
+
+
+def parse_credential(value):
+    """Parse one ``user:password`` string into a tuple.
+
+    The password may contain colons, so only the first one separates the two
+    parts.  CR/LF and NUL are rejected outright: this value is interpolated into
+    an HTTP header, and a credential that can terminate the header would let a
+    caller inject arbitrary request headers or split the request.
+    """
+    # Nothing below interpolates `value` or `password` into a message: this string
+    # is a secret, and it can reach a terminal scrollback or a CI log.
+    if not isinstance(value, str) or ":" not in value:
+        raise CredentialError(
+            "Credentials must be in 'user:password' form (the value given has no "
+            "':' and is {0} characters long).".format(
+                len(value) if isinstance(value, str) else "non-string"
+            )
+        )
+
+    user, password = value.split(":", 1)
+
+    if not user:
+        raise CredentialError(
+            "Credential has an empty username; the password is {0} characters "
+            "long.".format(len(password))
+        )
+
+    for field, name in ((user, "username"), (password, "password")):
+        if any(ch in field for ch in "\r\n\x00"):
+            raise CredentialError(
+                "Credential {0} must not contain CR, LF or NUL characters.".format(name)
+            )
+
+    try:
+        # RFC 7617 decodes Basic credentials as ISO-8859-1, and Tomcat does the
+        # same. Encoding as UTF-8 would send a non-ASCII password as mojibake
+        # that silently never validates.
+        "{0}:{1}".format(user, password).encode("latin-1")
+    except UnicodeEncodeError:
+        raise CredentialError(
+            "Credential contains characters outside ISO-8859-1, which HTTP Basic "
+            "authentication cannot transmit."
+        ) from None
+
+    return user, password
+
+
+CREDS_ENV_VAR = "AEM_HACKER_CREDS"
+
+
+def load_creds_file(path):
+    """Read ``user:password`` lines from *path*.
+
+    One per line; blank lines and ``#`` comments are ignored.  Never echoes the
+    contents, so a malformed line cannot spill a password into a log.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise CredentialError(
+            "Could not read credentials file: {0}".format(exc.strerror or exc)
+        ) from None
+    except UnicodeDecodeError:
+        # Credentials are ISO-8859-1 on the wire, so a file in that encoding is
+        # plausible; say so rather than raising a raw codec traceback.
+        raise CredentialError(
+            "Credentials file is not valid UTF-8. Re-save it as UTF-8, or pass "
+            "the credential with --creds."
+        ) from None
+
+    pairs = []
+    for number, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pairs.append(parse_credential(line))
+        except CredentialError as exc:
+            raise CredentialError(
+                "{0}, line {1}: {2}".format(path, number, exc)
+            ) from None
+    return pairs
+
+
+def warn_if_world_readable(path):
+    """Warn when a credentials file is readable by other users."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        # A warning, not an error: the scan can still proceed.
+        print(
+            "[!] Credentials file {0} is readable by other users "
+            "(mode {1:o}); consider chmod 600.".format(path, mode & 0o777),
+            file=sys.stderr,
+        )
+
+
+def collect_credentials(creds_values, creds_file):
+    """Gather credentials from --creds, --creds-file and the environment.
+
+    They combine: a password on the command line is visible in ``ps``,
+    ``/proc/*/cmdline`` and shell history, so the file and environment routes
+    exist for when that matters.
+    """
+    pairs = []
+    for value in creds_values or []:
+        pairs.append(parse_credential(value))
+
+    if creds_file:
+        warn_if_world_readable(creds_file)
+        pairs.extend(load_creds_file(creds_file))
+
+    from_env = os.environ.get(CREDS_ENV_VAR)
+    if from_env:
+        for line in from_env.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pairs.append(parse_credential(line))
+
+    seen = set()
+    out = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
+
+
+def primary_auth_header(fallback=None):
+    """Authorization header for the first supplied credential, else ``{}``.
+
+    Checks that need an authenticated *session* (rather than a credential
+    brute-force) use only the first pair, so supplying more credentials does not
+    multiply the request count.
+
+    With no ``--creds`` this returns an empty dict and the request stays
+    anonymous, which is how these checks have always behaved.  A check that has
+    always probed a known credential (version_disclosure) passes *fallback* to
+    keep doing so.
+    """
+    if credentials:
+        return basic_auth_header(credentials[0])
+    if fallback:
+        return basic_auth_header(fallback)
+    return {}
+
+
+def basic_auth_header(creds):
+    """Return the ``Authorization`` header for a ``user:password`` pair or string."""
+    if isinstance(creds, str):
+        creds = parse_credential(creds)
+    user, password = creds
+    # Named `encoded`, not `token`: `token` is the module-level SSRF
+    # correlation token, and a local of the same name is one edit away from
+    # clobbering it.
+    encoded = base64.b64encode(
+        "{0}:{1}".format(user, password).encode("latin-1")
+    ).decode("ascii")
+    return {"Authorization": "Basic {0}".format(encoded)}
+
+
+def decode_callback(raw, base_url):
+    """Decode an SSRF callback segment, or return None if it is not ours.
+
+    The correlation token is disclosed to every target the scanner touches (it is
+    part of the outbound URL), and the listener binds 0.0.0.0, so the target
+    itself — or anything else that can reach the port — can seed the callback
+    store. An empty segment also decodes successfully, which would otherwise
+    produce a finding with a blank URL for a target with no SSRF at all.
+
+    Only a callback naming a URL beginning with the *base_url* this check was
+    given is accepted.
+    """
+    try:
+        value = base64.b16decode(raw).decode()
+    except Exception:
+        return None
+    if not value or not value.startswith(base_url):
+        return None
+    return value
+
+
+def credentials_to_probe():
+    """Return the (user, password) pairs a check should try.
+
+    The supplied ``--creds`` in order, falling back to the built-in
+    default-credential list so today's behaviour is unchanged when the flag is
+    not used.  Duplicates are removed and the order preserved.
+    """
+    # Supplied credentials are *added to* the built-in list, not substituted for
+    # it: reaching a PR:L check with --creds must not silently disable
+    # "AEM with default credentials" detection.
+    pairs = [parse_credential(c) for c in CREDS] + list(credentials)
+    seen = set()
+    out = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
 
 
 class Detector(BaseHTTPRequestHandler):
@@ -88,6 +350,18 @@ class Detector(BaseHTTPRequestHandler):
     Requests must match the path pattern /<token>/<key>/<value>/ so that
     each check can identify its own SSRF hit by a unique key.
     """
+
+    # The listener is bound on 0.0.0.0, so anything that can reach it can open a
+    # connection. Without a timeout, a peer that connects and never sends a byte
+    # holds a worker thread and a file descriptor forever.
+    timeout = 15
+
+    # Bound what a peer can make this process allocate. The listener binds
+    # 0.0.0.0 and the correlation token is disclosed to every target the scanner
+    # touches, so an unauthenticated peer can reach this code.
+    max_values_per_key = 32
+    max_keys = 256
+    max_key_length = 64
 
     def __init__(self, token, d, *args):
         self.d = d
@@ -106,36 +380,163 @@ class Detector(BaseHTTPRequestHandler):
     def do_PUT(self):
         self.serve()
 
+    def record(self, key, value):
+        """Store a callback, within the configured bounds.
+
+        Capping values per key is not enough on its own: without a cap on the
+        number of distinct keys, a peer can still grow this without bound. The
+        listener binds 0.0.0.0 and the token is disclosed to every target the
+        scanner touches, so this code is reachable unauthenticated.
+        """
+        if len(key) > self.max_key_length:
+            return False
+        if key not in self.d and len(self.d) >= self.max_keys:
+            return False
+        values = self.d.setdefault(key, [])
+        if len(values) < self.max_values_per_key:
+            values.append(value)
+        return True
+
     def serve(self):
         """Record an SSRF hit if the path token matches and respond 200."""
         try:
             token, key, value = self.path.split("/")[1:4]
         except Exception:
-            self.send_response(200)
+            self.reply()
             return
 
         if self.token != token:
-            self.send_response(200)
+            self.reply()
             return
 
-        if key in self.d:
-            self.d[key].append(value)
-        else:
-            self.d[key] = [
-                value,
-            ]
+        self.record(key, value)
 
+        self.reply()
+
+    def reply(self):
+        """Send a well-formed, empty 200.
+
+        A response without Content-Length and without the blank line that
+        ``end_headers()`` writes leaves the client mid-header-stream, so the
+        vulnerable AEM sees a reset connection instead of a 200.  Some SSRF paths
+        only complete the chain on a clean response, and a half-written reply
+        also wedges a single-threaded listener.
+        """
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
-def register(name):
-    """Decorator factory that registers a check function under *name*."""
+def register(name, ssrf=False, experimental=False, default=True):
+    """Register a check function under *name*.
+
+    ``ssrf=True`` marks a check that cannot conclude anything without a reachable
+    callback listener, so the scanner can tell the user that ``--host`` is only
+    mandatory for those.
+
+    ``experimental=True`` marks a check whose detection logic could not be
+    validated against a real vulnerable AEM, and whose CVE attribution was found
+    to be wrong during an audit (see CVE_COVERAGE.md).  These still run by
+    default, but their findings are labelled and ``--strict`` skips them, so a
+    report never presents an unverified result as a confirmed one.
+
+    ``default=False`` makes a check reachable but opt-in: it appears in
+    ``--listhandlers`` and runs when named with ``--handler``, but is left out of
+    a plain run.  This is for a check the maintainer deliberately took out of the
+    default sweep -- it must not be silently lost, but the default blast radius
+    is the maintainer's call, not the reader's.
+    """
 
     def decorator(func):
+        func.ssrf = ssrf
+        func.experimental = experimental
+        func.default = default
         registered[name] = func
         return func
 
     return decorator
+
+
+# Keys that name the authenticated principal in a login-status response.
+# "id" is deliberately absent: as a bare substring it matches "identifier",
+# "invalid", id="..." and most error pages, which turned any 200 error body
+# without the word "anonymous" into a bogus "credentials work" finding.
+IDENTITY_KEYS = ("authorizableId", "userID", "userid", "profileId")
+
+# An explicit rejection wins over anything else in the body.
+REJECTED_RE = re.compile(r'"?authenticated"?\s*[:=]\s*"?false', re.IGNORECASE)
+
+# Form-encoded responses: userid=admin&resource=/...
+FORM_IDENTITY_RE = re.compile(
+    r"(?:^|[?&])(?:authorizableId|userid|profileId)=([^&\"'\s<>]+)", re.IGNORECASE
+)
+
+# Structural match for non-JSON bodies, so a stray "id" is not enough.
+IDENTITY_RE = re.compile(
+    r"\b(authorizableId|userid|profileid)\b\s*[:=]\s*[\"\']([^\"\'<>\s,&]+)",
+    re.IGNORECASE,
+)
+
+
+def username_of(creds):
+    """The username from a ``user:password`` string or a ``(user, password)`` pair."""
+    if isinstance(creds, str):
+        return parse_credential(creds)[0]
+    return creds[0]
+
+
+def authenticated_as(resp, creds):
+    """Return the principal name when *resp* proves *creds* were accepted, else None.
+
+    AEM's CurrentUser/UserInfo servlets answer an authenticated request with a
+    document naming the principal.  Anything else -- a 401, a 403, a login page,
+    an error body -- means the login was rejected, and must never be read as
+    success.  Requiring a 200 plus a named, non-anonymous principal is what
+    keeps a rejected login out of the findings.
+
+    The JSON path names the principal exactly.  A non-JSON body (the servlets
+    also answer XML/HTML depending on the selector) falls back to the same
+    "identity key present and anonymous absent" test the check already relied on,
+    so an accepted-but-unusual response format is not silently lost.
+    """
+    if resp.status_code != 200:
+        return None
+
+    body = resp.content.decode(errors="replace")
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = None
+
+    # An explicit rejection wins over anything else in the body, in every format.
+    # Applied to the raw body rather than to the parsed dict so that
+    # {"authenticated": false} and {"authenticated": "false"} agree.
+    if REJECTED_RE.search(body) or "anonymous" in body:
+        return None
+
+    if isinstance(payload, dict):
+        for key in IDENTITY_KEYS:
+            principal = payload.get(key)
+            if isinstance(principal, str) and principal and principal != "anonymous":
+                return principal
+        return None
+
+    # The form-encoded shape this servlet also returns:
+    #   authenticated=true&userid=admin&resource=/
+    form = FORM_IDENTITY_RE.search(body)
+    if form:
+        principal = form.group(1)
+        if principal != "anonymous":
+            return principal
+        return None
+
+    match = IDENTITY_RE.search(body)
+    if match and match.group(2) != "anonymous":
+        return match.group(2)
+
+    return None
 
 
 Finding = namedtuple("Finding", "name, url, description")
@@ -173,73 +574,61 @@ def error(message, **kwargs):
 def http_request(
     url, method="GET", data=None, additional_headers=None, proxy=None, debug=False
 ):
-    """Send an HTTP request inside a Session and return the response.
+    """Send an HTTP request on this thread's shared session and return the response.
 
-    An optional warm-up GET is issued first (same URL) so that session cookies
-    are populated before the actual check request.  SSL verification is
-    intentionally disabled.  Redirects are not followed.
+    State-changing requests are preceded by a warm-up GET on the same URL so that
+    session cookies are populated before the check request.  GET requests skip the
+    warm-up: repeating the identical GET doubled the request count for no benefit.
+    SSL verification is intentionally disabled.  Redirects are not followed.
     """
-    with requests.Session() as session:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36"
-        }
-        if additional_headers:
-            headers.update(additional_headers)
-        if extra_headers:
-            headers.update(
-                {
-                    # Retrieve the headers configured as extra headers but not controlled
-                    # by the application in this specific request
-                    h_name: h_value
-                    for h_name, h_value in extra_headers.items()
-                    if h_name not in headers
-                }
-            )
+    session = get_session()
+    headers = build_headers(additional_headers)
+    proxies = proxy if proxy else {}
 
-        if not proxy:
-            proxy = {}
+    if debug:
+        # stderr, not stdout: stdout is the machine-readable channel.
+        print(">> Sending {} {}".format(method, url), file=sys.stderr)
 
-        if debug:
-            print(">> Sending {} {}".format(method, url))
-
+    # One delay per request, not one per hop.
+    if request_delay:
         time.sleep(request_delay)
-        # Warm-up request to populate session state (e.g. cookies)
+
+    if method != "GET":
         session.get(
             url,
             verify=False,
             timeout=40,
             allow_redirects=False,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36"
-            },
+            headers={"User-Agent": USER_AGENT},
         )
-        time.sleep(request_delay)
-        if method == "GET":
-            resp = session.get(
-                url,
-                data=data,
-                headers=headers,
-                proxies=proxy,
-                verify=False,
-                timeout=40,
-                allow_redirects=False,
-            )
-        elif method == "POST":
-            resp = session.post(
-                url,
-                data=data,
-                headers=headers,
-                proxies=proxy,
-                verify=False,
-                timeout=40,
-                allow_redirects=False,
-            )
-        else:
-            raise ValueError("Unsupported HTTP method: {}".format(method))
 
-        if debug:
-            print("<< Received HTTP-{}".format(resp.status_code))
+    if method == "GET":
+        resp = session.get(
+            url,
+            data=data,
+            headers=headers,
+            proxies=proxies,
+            verify=False,
+            timeout=40,
+            allow_redirects=False,
+        )
+    elif method == "POST":
+        resp = session.post(
+            url,
+            data=data,
+            headers=headers,
+            proxies=proxies,
+            verify=False,
+            timeout=40,
+            allow_redirects=False,
+        )
+    else:
+        raise ValueError("Unsupported HTTP method: {}".format(method))
 
+    if debug:
+        print("<< Received HTTP-{}".format(resp.status_code), file=sys.stderr)
+
+    note_request(True)
     return resp
 
 
@@ -251,43 +640,32 @@ def http_request_multipart(
     Used for checks that need to upload binary payloads (e.g. deserialization PoC).
     SSL verification is intentionally disabled.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.81 Safari/537.36"
-    }
-    if additional_headers:
-        headers.update(additional_headers)
-    if extra_headers:
-        headers.update(
-            {
-                # Retrieve the headers configured as extra headers but not controlled
-                # by the application in this specific request
-                h_name: h_value
-                for h_name, h_value in extra_headers.items()
-                if h_name not in headers
-            }
-        )
-
-    if not proxy:
-        proxy = {}
+    headers = build_headers(additional_headers)
+    proxies = proxy if proxy else {}
 
     if debug:
-        print(">> Sending {} {}".format(method, url))
+        # stderr, not stdout: stdout is the machine-readable channel.
+        print(">> Sending {} {}".format(method, url), file=sys.stderr)
 
-    time.sleep(request_delay)
-    resp = requests.request(
+    if request_delay:
+        time.sleep(request_delay)
+    # On the shared session, so this does not pay a fresh TCP+TLS handshake for
+    # the one check that uploads a payload.
+    resp = get_session().request(
         method,
         url,
         files=data,
         headers=headers,
-        proxies=proxy,
+        proxies=proxies,
         verify=False,
         timeout=40,
         allow_redirects=False,
     )
 
     if debug:
-        print("<< Received HTTP-{}".format(resp.status_code))
+        print("<< Received HTTP-{}".format(resp.status_code), file=sys.stderr)
 
+    note_request(True)
     return resp
 
 
@@ -859,16 +1237,19 @@ def create_new_nodes(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    for path, creds in itertools.product(POSTSERVLET2, CREDS):
+    # This check keeps its own (smaller) credential set; --creds is appended
+    # rather than replacing it, so the default probe list is unchanged.
+    creds_list = [parse_credential(c) for c in CREDS] + list(credentials)
+
+    for path, creds in itertools.product(POSTSERVLET2, creds_list):
+        username = username_of(creds)
         url = normalize_url(base_url, path)
         try:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Referer": base_url,
-                "Authorization": "Basic {}".format(
-                    base64.b64encode(creds.encode()).decode()
-                ),
             }
+            headers.update(basic_auth_header(creds))
             data = "a=b"
             resp = http_request(
                 url, "POST", data=data, additional_headers=headers, proxy=proxy
@@ -882,7 +1263,7 @@ def create_new_nodes(base_url, my_host, debug=False, proxy=None):
                     "CreateJCRNodes",
                     url,
                     'It\'s possible to create new JCR nodes using POST Servlet as "{0}" user. '
-                    "You might get persistent XSS or RCE.".format(creds),
+                    "You might get persistent XSS or RCE.".format(username),
                 )
                 results.append(f)
                 break
@@ -944,17 +1325,20 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
     )
 
     results = []
-    for path, creds in itertools.product(POSTSERVLET, CREDS):
-        path = path.format(creds.split(":")[0])
+    creds_list = [parse_credential(c) for c in CREDS] + list(credentials)
+
+    for path, creds in itertools.product(POSTSERVLET, creds_list):
+        username = username_of(creds)
+        # Escape: an unescaped username could contain '/' or '..' and retarget
+        # the request.
+        path = path.format(urllib.parse.quote(username, safe=""))
         url = normalize_url(base_url, path)
         try:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Referer": base_url,
-                "Authorization": "Basic {}".format(
-                    base64.b64encode(creds.encode()).decode()
-                ),
             }
+            headers.update(basic_auth_header(creds))
             data = "a=b"
             resp = http_request(
                 url, "POST", data=data, additional_headers=headers, proxy=proxy
@@ -969,7 +1353,7 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
                     url,
                     'It\'s possible to create new JCR nodes using POST Servlet. As Geometrixx user "{0}". '
                     "You might get persistent XSS or perform other attack by accessing servlets registered by Resource Type.".format(
-                        creds
+                        username
                     ),
                 )
                 results.append(f)
@@ -988,7 +1372,6 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
 @register("loginstatus_servlet")
 def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed LoginStatusServlet and test default credentials against it."""
-    global CREDS
 
     r = random_string(3)
     LOGINSTATUS = itertools.product(
@@ -1017,7 +1400,14 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
         try:
             resp = http_request(url, proxy=proxy, debug=debug)
 
-            if resp.status_code == 200 and "authenticated=" in str(resp.content):
+            # Accept both response shapes: the JSON form
+            # ({"authenticated": true, "userid": ...}) and the form-encoded one
+            # (authenticated=true&userid=...). Matching only "authenticated="
+            # missed the JSON form this servlet returns for a .json selector.
+            body = str(resp.content)
+            if resp.status_code == 200 and (
+                "authenticated=" in body or '"authenticated"' in body
+            ):
                 f = Finding(
                     "LoginStatusServlet",
                     url,
@@ -1026,22 +1416,38 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
-                    if "authenticated=true" in str(resp.content):
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}".'.format(creds),
-                        )
+                    # A rejected login is any response that is not a 200 naming a
+                    # real user.  Testing the body for "anonymous" alone reported
+                    # every 401/403/error page as working default credentials.
+                    principal = authenticated_as(resp, (username, password))
+                    if principal:
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -1056,10 +1462,9 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-# @register('currentuser_servlet')
+@register("currentuser_servlet", default=False)
 def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
-    """Check for an exposed CurrentUserServlet and test default credentials against it (disabled by default)."""
-    global CREDS
+    """Check for an exposed CurrentUserServlet and test credentials against it."""
 
     r = random_string(3)
     CURRENTUSER = itertools.product(
@@ -1101,22 +1506,37 @@ def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
-                    if "anonymous" not in str(resp.content):
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}".'.format(creds),
-                        )
+                    # Same reasoning as the LoginStatusServlet check above: a
+                    # 401/403/error body proves nothing about the credentials.
+                    principal = authenticated_as(resp, (username, password))
+                    if principal:
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -1134,7 +1554,6 @@ def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
 @register("userinfo_servlet")
 def exposed_userinfo_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed UserInfoServlet and test default credentials against it."""
-    global CREDS
 
     r = random_string(3)
     USERINFO = itertools.product(
@@ -1173,22 +1592,37 @@ def exposed_userinfo_servlet(base_url, my_host, debug=False, proxy=None):
                 )
                 results.append(f)
 
-                for creds in CREDS:
-                    headers = {
-                        "Authorization": "Basic {}".format(
-                            base64.b64encode(creds.encode()).decode()
-                        )
-                    }
+                # A credential the user supplied is not a "default" one; say so,
+                # or the report would credit the target with a weak password the
+                # operator chose themselves.
+                supplied = bool(credentials)
+
+                for username, password in credentials_to_probe():
                     resp = http_request(
-                        url, additional_headers=headers, proxy=proxy, debug=debug
+                        url,
+                        additional_headers=basic_auth_header((username, password)),
+                        proxy=proxy,
+                        debug=debug,
                     )
 
-                    if "anonymous" not in str(resp.content):
-                        f = Finding(
-                            "AEM with default credentials",
-                            url,
-                            'AEM with default credentials "{0}".'.format(creds),
-                        )
+                    # Same reasoning as the LoginStatusServlet check above: a
+                    # 401/403/error body proves nothing about the credentials.
+                    principal = authenticated_as(resp, (username, password))
+                    if principal:
+                        if supplied:
+                            f = Finding(
+                                "Valid credential",
+                                url,
+                                'The credential supplied for user "{0}" is valid '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
+                        else:
+                            f = Finding(
+                                "AEM with default credentials",
+                                url,
+                                'AEM with default credentials for user "{0}" '
+                                "(authenticated as {1}).".format(username, principal),
+                            )
                         results.append(f)
 
                 break
@@ -1236,7 +1670,8 @@ def exposed_felix_console(base_url, my_host, debug=False, proxy=None):
     results = []
     for path in FELIXCONSOLE:
         url = normalize_url(base_url, path)
-        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}
+        # A supplied credential, else the admin:admin probe this check always made.
+        headers = primary_auth_header(fallback=("admin", "admin"))
         try:
             resp = http_request(
                 url, additional_headers=headers, proxy=proxy, debug=debug
@@ -1484,9 +1919,9 @@ def exposed_crxde_crx(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-# @register('reports')
+@register("reports", default=False)
 def exposed_reports(base_url, my_host, debug=False, proxy=None):
-    """Check for an exposed Disk Usage report (disabled by default)."""
+    """Check for an exposed Disk Usage report."""
     r = random_string(3)
 
     DISKUSAGE = itertools.product(
@@ -1518,7 +1953,7 @@ def exposed_reports(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("salesforcesecret_servlet")
+@register("salesforcesecret_servlet", ssrf=True)
 def ssrf_salesforcesecret_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via SalesforceSecretServlet (CVE-2018-5006); waits for a callback on my_host."""
     global token, d
@@ -1611,23 +2046,33 @@ def ssrf_salesforcesecret_servlet(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "salesforcesecret" in d:
-        u = base64.b16decode(d.get("salesforcesecret")[0]).decode()
-        f = Finding(
-            "SalesforceSecretServlet",
-            u,
-            "SSRF via SalesforceSecretServlet (CVE-2018-5006) was detected. "
-            "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("salesforcesecret")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'salesforcesecret' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "SalesforceSecretServlet",
+                u,
+                "SSRF via SalesforceSecretServlet (CVE-2018-5006) was detected. "
+                "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
 
-@register("reportingservices_servlet")
+@register("reportingservices_servlet", ssrf=True)
 def ssrf_reportingservices_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via ReportingServicesServlet (CVE-2018-12809); waits for a callback on my_host."""
     global token, d
@@ -1727,23 +2172,33 @@ def ssrf_reportingservices_servlet(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "reportingservices" in d:
-        u = base64.b16decode(d.get("reportingservices")[0]).decode()
-        f = Finding(
-            "ReportingServicesServlet",
-            u,
-            "SSRF via ReportingServicesServlet (CVE-2018-12809) was detected. "
-            "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("reportingservices")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'reportingservices' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "ReportingServicesServlet",
+                u,
+                "SSRF via ReportingServicesServlet (CVE-2018-12809) was detected. "
+                "See - https://helpx.adobe.com/security/products/experience-manager/apsb18-23.html",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
 
-@register("sitecatalyst_servlet")
+@register("sitecatalyst_servlet", ssrf=True)
 def ssrf_sitecatalyst_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via SiteCatalystServlet; waits for a callback on my_host."""
     global token, d
@@ -1842,23 +2297,33 @@ def ssrf_sitecatalyst_servlet(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "sitecatalyst" in d:
-        u = base64.b16decode(d.get("sitecatalyst")[0]).decode()
-        f = Finding(
-            "SiteCatalystServlet",
-            u,
-            "SSRF via SiteCatalystServlet was detected. "
-            "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("sitecatalyst")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'sitecatalyst' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "SiteCatalystServlet",
+                u,
+                "SSRF via SiteCatalystServlet was detected. "
+                "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
 
-@register("autoprovisioning_servlet")
+@register("autoprovisioning_servlet", ssrf=True)
 def ssrf_autoprovisioning_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via AutoProvisioningServlet; waits for a callback on my_host."""
     global token, d
@@ -1951,23 +2416,33 @@ def ssrf_autoprovisioning_servlet(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "autoprovisioning" in d:
-        u = base64.b16decode(d.get("autoprovisioning")[0]).decode()
-        f = Finding(
-            "AutoProvisioningServlet",
-            u,
-            "SSRF via AutoProvisioningServlet was detected. "
-            "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("autoprovisioning")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'autoprovisioning' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "AutoProvisioningServlet",
+                u,
+                "SSRF via AutoProvisioningServlet was detected. "
+                "It might result in RCE - https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps?slide=87",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
 
-@register("opensocial_proxy")
+@register("opensocial_proxy", ssrf=True)
 def ssrf_opensocial_proxy(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via the OpenSocial (Shindig) proxy endpoint; waits for a callback on my_host."""
     global token, d
@@ -2048,23 +2523,33 @@ def ssrf_opensocial_proxy(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "opensocial" in d:
-        u = base64.b16decode(d.get("opensocial")[0]).decode()
-        f = Finding(
-            "Opensocial (shindig) proxy",
-            u,
-            "SSRF via Opensocial (shindig) proxy. "
-            "See - https://speakerdeck.com/fransrosen/a-story-of-the-passive-aggressive-sysadmin-of-aem?slide=41",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("opensocial")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'opensocial' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "Opensocial (shindig) proxy",
+                u,
+                "SSRF via Opensocial (shindig) proxy. "
+                "See - https://speakerdeck.com/fransrosen/a-story-of-the-passive-aggressive-sysadmin-of-aem?slide=41",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
 
-@register("opensocial_makeRequest")
+@register("opensocial_makeRequest", ssrf=True)
 def ssrf_opensocial_makeRequest(base_url, my_host, debug=False, proxy=None):
     """Check for SSRF via the OpenSocial (Shindig) makeRequest endpoint; waits for a callback on my_host."""
     global token, d
@@ -2157,17 +2642,27 @@ def ssrf_opensocial_makeRequest(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "opensocialmakerequest" in d:
-        u = base64.b16decode(d.get("opensocialmakerequest")[0]).decode()
-        f = Finding(
-            "Opensocial (shindig) makeRequest",
-            u,
-            "SSRF via Opensocial (shindig) makeRequest. You can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
-        )
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("opensocialmakerequest")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'opensocialmakerequest' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "Opensocial (shindig) makeRequest",
+                u,
+                "SSRF via Opensocial (shindig) makeRequest. You can specify parameters httpMethod, postData, headers, contentType for makeRequest.",
+            )
 
-        results.append(f)
+            results.append(f)
 
     return results
 
@@ -2510,8 +3005,9 @@ def exposed_acs_tools(base_url, my_host, debug=False, proxy=None):
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": base_url,
-            "Authorization": "Basic YWRtaW46YWRtaW4=",
         }
+        # A supplied credential, else the admin:admin probe this check always made.
+        headers.update(primary_auth_header(fallback=("admin", "admin")))
         try:
             resp = http_request(
                 url,
@@ -2580,25 +3076,13 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
             "/libs/granite/core/content/login.html",
             "///libs///granite///core///content///login.html",
         ),
-        (
-            "",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-            ";%0a{0}.html",
-        ),
+        ("", "/{0}.css", "/{0}.html", ";%0a{0}.css", ";%0a{0}.html"),
     )
     LOGINPATHS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in LOGINPATHS)
 
     PRODUCTINFO = itertools.product(
         ("/system/console/productinfo", "///system///console///productinfo"),
-        (
-            "",
-            ".json",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-        ),
+        ("", ".json", "/{0}.css", "/{0}.html", ";%0a{0}.css"),
     )
     PRODUCTINFO = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in PRODUCTINFO)
 
@@ -2649,7 +3133,9 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
 
     for path in PRODUCTINFO:
         url = normalize_url(base_url, path)
-        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}
+        # A configured credential, else the admin:admin probe this check has
+        # always made.
+        headers = primary_auth_header(fallback=("admin", "admin"))
         try:
             resp = http_request(
                 url, additional_headers=headers, proxy=proxy, debug=debug
@@ -2680,14 +3166,18 @@ def check_version_disclosure(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("open_redirect")
+@register("open_redirect", experimental=True)
 def check_open_redirect(base_url, my_host, debug=False, proxy=None):
-    """Check for open redirect vulnerability (CVE-2023-29297) via AEM login page resource parameter.
+    """Check for an open redirect on the AEM login page's 'resource' parameter.
 
-    CVE-2023-29297 (APSB23-31): Improper Input Validation in the login page allows an
-    unauthenticated attacker to redirect a user to an arbitrary external domain via the
-    'resource' query parameter.  Affected versions: AEM 6.5.16.0 and earlier.
-    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html
+    AUDIT NOTE: the CVE attribution was **wrong**.  CVE-2023-29297 is an Adobe
+    *Commerce / Magento* template-injection issue (APSB23-35), not AEM.  The AEM
+    open redirect in the login page is **CVE-2023-29307** (APSB23-31), rated
+    **3.5 (Low)**, affecting AEM 6.5.16.0 and earlier -- and Adobe's vector is
+    ``PR:L / UI:R``: it needs a low-privilege *authenticated* user, not an
+    anonymous one.  The check below is therefore anonymous-only, so it can only
+    ever detect a broader misconfiguration, and a clean result does not mean the
+    instance is not affected.
     """
     # Use a safe, non-routable domain name as the redirect target – we never actually contact it
     REDIRECT_TEST_DOMAIN = "evil.example.com"
@@ -2707,10 +3197,11 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    auth = primary_auth_header()
     for path in REDIRECT_PATHS:
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             location = resp.headers.get("Location", "")
             # Only flag when Location is an absolute URL (https?:// or //) whose
@@ -2724,9 +3215,12 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
                     f = Finding(
                         "OpenRedirect",
                         url,
-                        "Open redirect (CVE-2023-29297) detected. "
-                        "The login page redirects to an external domain via the 'resource' parameter. "
-                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-31.html",
+                        "Open redirect detected: the login page redirects to an "
+                        "external domain via the 'resource' parameter. Related to "
+                        "CVE-2023-29307 (APSB23-31, CVSS 3.5), which Adobe rates "
+                        "PR:L/UI:R -- this anonymous probe can only show a wider "
+                        "misconfiguration. This check is unvalidated; confirm "
+                        "manually before reporting.",
                     )
                     results.append(f)
                     break
@@ -2741,32 +3235,29 @@ def check_open_redirect(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("auth_bypass_cve_2023_38205")
+@register("auth_bypass_cve_2023_38205", experimental=True)
 def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None):
-    """Check for authentication bypass (CVE-2023-38205) via double-slash path manipulation.
+    """Check for dispatcher auth bypass reaching the Felix/CRX admin consoles.
 
-    CVE-2023-38205 (APSB23-43): Improper Access Control.  The Dispatcher can be bypassed
-    to reach protected endpoints (Felix OSGi Console, CRX Package Manager) by using
-    double- or triple-forward-slash prefixes that the Dispatcher filter does not normalise
-    before handing the request to AEM/Sling.  Includes the related Detectify 2021 CRX
-    Package Manager bypass.
-    Affected versions: AEM 6.5.17.0 and earlier.
-    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html
-    Reference: https://labs.detectify.com/writeups/undocumented-authentication-bypass-issue-in-aem-package-manager-blog-updated/
+    AUDIT NOTE: the handler name is historical and its CVE attribution was
+    **wrong**.  CVE-2023-38205 is an Adobe *ColdFusion* improper-access-control
+    issue (APSB23-47, CVSS 7.5, a double-*dot* bypass) and has nothing to do with
+    AEM.  APSB23-43 is the AEM bulletin, and it covers reflected XSS
+    (CVE-2023-38214 / CVE-2023-38215, CVSS 5.4), not this bypass.
+
+    What this check actually probes is the real, separately-disclosed AEM issue:
+    the CRX Package Manager / Felix Console authentication bypass via dispatcher
+    filter-bypass characters (Detectify, 2021).  It is a genuine class of AEM
+    weakness, but it has no CVE, so the finding below cites the technique rather
+    than a CVE number.  Detection is unvalidated against a live AEM: the tool
+    marks the endpoint reachable and requires the console's own page text, which
+    a patched instance will not return.
     """
     r = random_string(3)
 
     FELIX_BYPASS = itertools.product(
-        (
-            "//system//console//bundles",
-            "////system////console////bundles",
-        ),
-        (
-            "",
-            "/{0}.css",
-            "/{0}.html",
-            ";%0a{0}.css",
-        ),
+        ("//system//console//bundles", "////system////console////bundles"),
+        ("", "/{0}.css", "/{0}.html", ";%0a{0}.css"),
     )
     FELIX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in FELIX_BYPASS)
 
@@ -2777,11 +3268,7 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
             "//crx//de//index.jsp",
             "////crx////de////index.jsp",
         ),
-        (
-            "",
-            ";%0a{0}.css",
-            "/{0}.css",
-        ),
+        ("", ";%0a{0}.css", "/{0}.css"),
     )
     CRX_BYPASS = list("{0}{1}".format(p1, p2.format(r)) for p1, p2 in CRX_BYPASS)
 
@@ -2796,9 +3283,11 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
                 f = Finding(
                     "AuthBypassFelixConsole",
                     url,
-                    "Felix Console is accessible without authentication via double-slash "
-                    "dispatcher bypass (CVE-2023-38205). RCE via bundle upload is possible. "
-                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html",
+                    "Felix Console is reachable without authentication via a "
+                    "dispatcher filter-bypass path (CRX/Felix auth bypass, "
+                    "Detectify 2021 -- this issue has no CVE). RCE via OSGi "
+                    "bundle upload is possible. This check is unvalidated; "
+                    "confirm manually before reporting.",
                 )
                 results.append(f)
                 break
@@ -2822,10 +3311,11 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
                 f = Finding(
                     "AuthBypassCRX",
                     url,
-                    "CRX Package Manager or CRXDE Lite is accessible without authentication "
-                    "via double-slash dispatcher bypass (CVE-2023-38205 / Detectify 2021). "
+                    "CRX Package Manager or CRXDE Lite is reachable without "
+                    "authentication via a dispatcher filter-bypass path (CRX "
+                    "auth bypass, Detectify 2021 -- this issue has no CVE). "
                     "Unauthenticated package upload (RCE) may be possible. "
-                    "See - https://helpx.adobe.com/security/products/experience-manager/apsb23-43.html",
+                    "This check is unvalidated; confirm manually before reporting.",
                 )
                 results.append(f)
                 break
@@ -2840,23 +3330,25 @@ def check_auth_bypass_cve_2023_38205(base_url, my_host, debug=False, proxy=None)
     return results
 
 
-@register("xss_aem_forms")
+@register("xss_aem_forms", experimental=True)
 def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
-    """Check for reflected XSS in AEM Forms endpoints (CVE-2021-36063).
+    """Check for reflected XSS in AEM Forms endpoints.
 
-    CVE-2021-36063 (APSB21-77): Reflected Cross-site Scripting in AEM Forms components.
-    Affected versions: AEM Forms 6.5.10.0 and earlier.
-    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb21-77.html
+    AUDIT NOTE: the CVE attribution was **wrong**.  CVE-2021-36063 is a reflected
+    XSS in **Adobe Connect** 11.2.2 and earlier (APSB21-66), not AEM Forms, and it
+    is not the issue this probe tests.  The AEM Forms XSS issues in that era are
+    the APSB21-103 family (CVE-2021-44178 reflected, and CVE-2021-43761/43764
+    stored), which are PR:L or require an authenticated form context.
+
+    What is tested here is only the generic "does an AEM Forms path echo a query
+    parameter unencoded" misconfiguration.  It is not a check for any specific
+    CVE, and it is unvalidated against a live AEM.
     """
     r = random_string(3)
 
     # Common AEM Forms endpoints known to reflect unsanitised input
     FORMS_XSS = itertools.product(
-        (
-            "/content/forms/af",
-            "/libs/fd/af/components",
-            "///content///forms///af",
-        ),
+        ("/content/forms/af", "/libs/fd/af/components", "///content///forms///af"),
         (
             ".html?{0}=<1337xss>",
             ".json/{0}.html?dummyParam=<1337xss>",
@@ -2867,10 +3359,14 @@ def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    # Adobe rates the related AEM Forms XSS issues PR:L/UI:R, so an anonymous
+    # probe can only show the reflection primitive. Supply --creds to test the
+    # authenticated case the CVE actually describes.
+    auth = primary_auth_header()
     for path in FORMS_XSS:
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             if resp.status_code == 200 and "<1337xss>" in str(resp.content):
                 ct = content_type(resp.headers.get("Content-Type", ""))
@@ -2878,9 +3374,11 @@ def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
                     f = Finding(
                         "XSS in AEM Forms",
                         url,
-                        "Reflected XSS detected in AEM Forms endpoint (CVE-2021-36063). "
-                        "User-supplied input is echoed without HTML encoding. "
-                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb21-77.html",
+                        "Reflected XSS detected in an AEM Forms endpoint: "
+                        "user-supplied input is echoed without HTML encoding. "
+                        "This is a generic misconfiguration check, not a specific "
+                        "CVE test, and it is unvalidated; confirm manually before "
+                        "reporting.",
                     )
                     results.append(f)
                     break
@@ -2895,15 +3393,17 @@ def check_xss_aem_forms(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("xss_reflected_cve_2022")
+@register("xss_reflected_cve_2022", experimental=True)
 def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
-    """Check for reflected XSS in AEM TouchUI and workflow components (CVE-2022-30677, CVE-2022-30679).
+    """Check for reflected XSS in AEM TouchUI and workflow components.
 
-    CVE-2022-30677 / CVE-2022-30679 (APSB22-40): Multiple reflected XSS vulnerabilities
-    in AEM TouchUI shell and workflow console components.  User-controlled input from URL
-    selectors or query parameters is echoed unencoded in HTML responses.
-    Affected versions: AEM 6.5.13.0 and earlier.
-    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html
+    AUDIT NOTE: the two CVE numbers do not share a bulletin.  **CVE-2022-30677**
+    is an AEM reflected XSS in **APSB22-40** (AEM 6.5.13.0 and earlier, CVSS 5.4),
+    but **CVE-2022-30679** ships in **APSB22-59** (AEM 6.5.14.0 and earlier, CVSS
+    5.4) -- the previous entry cited APSB22-40 for both.  Adobe's vectors for both
+    are ``PR:L / UI:R``: they require a low-privilege authenticated user and user
+    interaction, so the anonymous probe below can demonstrate the reflection
+    primitive but cannot establish that a given instance is CVE-affected.
     """
     r = random_string(3)
 
@@ -2928,10 +3428,12 @@ def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
 
     results = []
 
+    # Both CVEs are PR:L/UI:R; pass --creds to probe the authenticated case.
+    auth = primary_auth_header()
     for path in list(TOUCHUI_XSS) + list(SHELL_XSS):
         url = normalize_url(base_url, path)
         try:
-            resp = http_request(url, proxy=proxy, debug=debug)
+            resp = http_request(url, additional_headers=auth, proxy=proxy, debug=debug)
 
             if resp.status_code == 200 and "<1337xss>" in str(resp.content):
                 ct = content_type(resp.headers.get("Content-Type", ""))
@@ -2939,10 +3441,13 @@ def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
                     f = Finding(
                         "XSS in AEM TouchUI",
                         url,
-                        "Reflected XSS detected in AEM TouchUI/workflow endpoint "
-                        "(CVE-2022-30677 / CVE-2022-30679). "
-                        "User-supplied input is echoed without HTML encoding. "
-                        "See - https://helpx.adobe.com/security/products/experience-manager/apsb22-40.html",
+                        "Reflected XSS detected in an AEM TouchUI/workflow "
+                        "endpoint: user-supplied input is echoed without HTML "
+                        "encoding. The related AEM issues (CVE-2022-30677 in "
+                        "APSB22-40, CVE-2022-30679 in APSB22-59) are rated PR:L/UI:R "
+                        "at 5.4, so this anonymous probe shows the reflection "
+                        "primitive only. This check is unvalidated; confirm "
+                        "manually before reporting.",
                     )
                     results.append(f)
                     break
@@ -2957,14 +3462,24 @@ def check_xss_reflected_cve_2022(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("ssrf_cve_2021_40722")
+@register("ssrf_cve_2021_40722", ssrf=True, experimental=True)
 def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
-    """Check for unauthenticated SSRF (CVE-2021-40722) via AEM proxy servlet endpoints.
+    """Check for unauthenticated SSRF via the AEM content-sync/replication endpoint.
 
-    CVE-2021-40722 (APSB21-99): Server-Side Request Forgery allows an unauthenticated
-    attacker to make the AEM server issue HTTP requests to arbitrary internal hosts.
-    Affected versions: AEM 6.5.10.0 and earlier (on-premise).
-    Reference: https://helpx.adobe.com/security/products/experience-manager/apsb21-99.html
+    AUDIT NOTE: the CVE attribution was **wrong**, in both class and severity.
+    CVE-2021-40722 is an **XXE leading to arbitrary code execution** in AEM Forms,
+    **CVSS 9.8 Critical**, in bulletin **APSB21-103** (AEM 6.5.10.0 and earlier) --
+    not an SSRF, and not APSB21-99.  It is detected by submitting external-entity
+    XML, which this check does not do.
+
+    What this probes is a genuine and separately-reported AEM SSRF class: the
+    content-sync replication endpoint fetching a caller-supplied ``path``.  The
+    2021 AEM SSRF with the closest match is **CVE-2021-28627** (APSB21-39, CVSS
+    5.4, PR:L) -- authenticated, not unauthenticated as the finding claimed.
+
+    Because neither the CVE nor the preconditions match, the finding is labelled
+    unverified and ``--strict`` skips the check.  Treat a positive as "this
+    endpoint is worth investigating", not as a confirmed CVE hit.
     """
     global token, d
 
@@ -3009,20 +3524,47 @@ def ssrf_cve_2021_40722(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    time.sleep(10)
+    time.sleep(ssrf_timeout)
 
     if "cve202140722" in d:
-        u = base64.b16decode(d.get("cve202140722")[0]).decode()
-        f = Finding(
-            "SSRF CVE-2021-40722",
-            u,
-            "Unauthenticated SSRF (CVE-2021-40722) detected via AEM content-sync/replication endpoint. "
-            "An attacker can pivot to internal services. "
-            "See - https://helpx.adobe.com/security/products/experience-manager/apsb21-99.html",
-        )
-        results.append(f)
+        # Only a callback naming a URL we actually asked this check to fetch
+        # is trusted; the token is public to every target we touch.
+        u = decode_callback(d.get("cve202140722")[0], base_url)
+        if u is None:
+            # No finding: a rejected callback must never become a report line.
+            print(
+                "[!] Ignoring an SSRF callback for 'cve202140722' that did not "
+                "name a requested URL.",
+                file=sys.stderr,
+            )
+        else:
+            f = Finding(
+                "SSRF (unverified CVE attribution)",
+                u,
+                "The content-sync/replication endpoint fetched a caller-supplied URL, "
+                "which indicates an SSRF. NOTE: this is not CVE-2021-40722 -- that CVE "
+                "is an XXE/RCE (APSB21-103, 9.8 Critical) and is not detected here. The "
+                "nearest AEM SSRF is CVE-2021-28627 (APSB21-39, 5.4, PR:L). An attacker "
+                "can pivot to internal services. This check is unvalidated; confirm "
+                "manually before reporting.",
+            )
+            results.append(f)
 
     return results
+
+
+# Exit codes. Kept distinct on purpose: a consumer of this tool most needs to
+# tell "this is vulnerable" apart from "I could not scan this".
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_INCOMPLETE = 2
+EXIT_USAGE = 3
+
+
+def usage_error(message):
+    """Report a usage or preflight problem and exit with EXIT_USAGE."""
+    print(message, file=sys.stderr)
+    sys.exit(EXIT_USAGE)
 
 
 def parse_args():
@@ -3058,39 +3600,147 @@ def parse_args():
     parser.add_argument(
         "--delay", type=float, default=0, help="seconds between requests"
     )
+    parser.add_argument(
+        "--ssrf-timeout",
+        type=int,
+        default=10,
+        help="seconds to wait for SSRF callbacks to arrive",
+    )
+    parser.add_argument(
+        "--creds-file",
+        metavar="PATH",
+        help="read credentials from a file, one 'user:password' per line "
+        "('#' comments and blank lines allowed). Preferred over --creds, "
+        "which exposes the password in ps and shell history",
+    )
+    parser.add_argument(
+        "--creds",
+        action="append",
+        metavar="USER:PASS",
+        help="credential to use for checks that need an authenticated session; "
+        "repeatable. Most AEM CVEs are low-privilege or require user "
+        "interaction and cannot be detected anonymously",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="output format; 'json' is suitable for piping into other tools",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="skip checks marked experimental (unvalidated detection logic, or a "
+        "CVE attribution corrected during audit); findings from them are labelled "
+        "as unverified when they do run",
+    )
+    parser.add_argument(
+        "--output", help="write the report to this file instead of stdout"
+    )
 
     return parser.parse_args(sys.argv[1:])
+
+
+def find_free_port():
+    """Return a port the OS says is free, for the callback listener.
+
+    Binding the requested port fails when something already holds it; rather than
+    aborting a scan that has not started yet, move to a free port and say so.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def run_detector(port):
     """Start the SSRF callback listener on *port* in a background daemon thread.
 
-    Returns the HTTPServer instance so the caller can shut it down after scanning.
+    A threading server is used deliberately: the single-threaded one served one
+    connection at a time, so a callback that opened a socket and stalled could
+    wedge every later SSRF check.  Returns the server so the caller can shut it
+    down after scanning.
     """
     global token, d
 
     handler = lambda *args: Detector(token, d, *args)
-    httpd = HTTPServer(("", port), handler)
+    try:
+        httpd = ThreadingHTTPServer(("", port), handler)
+    except OSError as exc:
+        free = find_free_port()
+        print(
+            "[!] Port {0} is unavailable ({1}); using {2} for SSRF callbacks "
+            "instead -- pass the same --port on the command line to your "
+            "listener.".format(port, exc, free),
+            file=sys.stderr,
+        )
+        httpd = ThreadingHTTPServer(("", free), handler)
 
-    t = Thread(target=httpd.serve_forever)
-    t.daemon = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
 
     return httpd
 
 
+def run_check(check, base_url, my_host, debug, proxy):
+    """Run one check on this worker thread, recording its request outcomes.
+
+    Returns ``(findings, requests_made)``. A check whose every request failed
+    returns an empty finding list that looks exactly like a clean result, so the
+    caller needs the tally to tell the two apart.
+    """
+    _local.requests = []
+    try:
+        results = check(base_url, my_host, debug, proxy)
+        return results, list(_local.requests)
+    finally:
+        _local.requests = None
+
+
+def emit(finding, sink, fmt):
+    """Write one finding to *sink* in the requested format."""
+    if fmt == "json":
+        sink.write(
+            json.dumps(
+                {
+                    "name": finding.name,
+                    "url": finding.url,
+                    "description": finding.description,
+                }
+            )
+            + "\n"
+        )
+    else:
+        sink.write("[+] New Finding!!!\n")
+        sink.write("\tName: {}\n".format(finding.name))
+        sink.write("\tUrl: {}\n".format(finding.url))
+        sink.write("\tDescription: {}\n\n".format(finding.description))
+    sink.flush()
+
+
 def main():
-    """Entry point: start the SSRF listener, run all selected checks concurrently, and print findings."""
+    """Entry point: start the SSRF listener, run all selected checks concurrently, and report findings."""
     global extra_headers
+    global credentials
     global request_delay
+    global ssrf_timeout
 
     args = parse_args()
 
     request_delay = args.delay
+    ssrf_timeout = args.ssrf_timeout
 
     if args.listhandlers:
-        print("[*] Available handlers: {0}".format(list(registered.keys())))
-        sys.exit(1337)
+        for name, func in registered.items():
+            marks = []
+            if not getattr(func, "default", True):
+                marks.append("opt-in, use --handler")
+            if getattr(func, "ssrf", False):
+                marks.append("needs --host")
+            if getattr(func, "experimental", False):
+                marks.append("experimental, skipped by --strict")
+            suffix = "  [{0}]".format("; ".join(marks)) if marks else ""
+            print("{0}{1}".format(name, suffix))
+        sys.exit(0)
 
     if args.proxy:
         p = args.proxy
@@ -3104,54 +3754,205 @@ def main():
             # (e.g. X-Custom-Header: key:value:data) are preserved intact.
             header_data = header.split(":", 1)
             if len(header_data) != 2 or not header_data[0].strip():
-                print(
+                usage_error(
                     "Malformed header '{0}'. Expected format: 'Name: Value'.".format(
                         header
-                    )
+                    ),
                 )
-                sys.exit(1337)
+            # Same reasoning as --creds: this value is interpolated into a request
+            # header, and one containing CR/LF could split the request.
+            if any(ch in header for ch in "\r\n\x00"):
+                usage_error(
+                    "Header names and values must not contain CR, LF or NUL "
+                    "characters.",
+                )
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:
         extra_headers = {}
 
-    if not args.url:
-        print("You must specify the -u parameter, bye.")
-        sys.exit(1337)
+    try:
+        credentials = collect_credentials(args.creds, args.creds_file)
+    except CredentialError as exc:
+        # The password is never echoed back, so a mistyped value cannot leak
+        # into a terminal scrollback or a CI log.
+        usage_error(
+            "Bad credential: {0}".format(exc),
+        )
 
-    if not args.host:
-        print("You must specify the --host parameter, bye.")
-        sys.exit(1337)
+    if not args.url:
+        usage_error(
+            "You must specify the -u parameter, bye.",
+        )
+
+    if args.handler:
+        unknown = [h for h in args.handler if h not in registered]
+        if unknown:
+            # Silently scanning nothing looks identical to a clean result, which
+            # is the worst possible failure mode for a security tool.
+            usage_error(
+                "Unknown handler(s): {0}\nAvailable handlers: {1}".format(
+                    ", ".join(unknown), ", ".join(sorted(registered))
+                )
+            )
+        selected = [(name, registered[name]) for name in args.handler]
+    else:
+        # Opt-in checks are reachable but not part of a plain run. Announce what
+        # was left out: silently narrowing a scan is the failure mode this tool
+        # has been fixing all along.
+        opt_in = [n for n, f in registered.items() if not getattr(f, "default", True)]
+        if opt_in:
+            print(
+                "[*] Not running {0} opt-in check(s) by default: {1}\n"
+                "    Run one with: --handler <name>".format(
+                    len(opt_in), ", ".join(sorted(opt_in))
+                ),
+                file=sys.stderr,
+            )
+        selected = [
+            (name, func)
+            for name, func in registered.items()
+            if getattr(func, "default", True)
+        ]
+
+    if args.strict:
+        skipped = [
+            name for name, func in selected if getattr(func, "experimental", False)
+        ]
+        if skipped:
+            # A warning, not an error: --strict filters the experimental checks
+            # out and scans the rest.
+            print(
+                "[*] --strict: skipping {0} experimental check(s): {1}".format(
+                    len(skipped), ", ".join(skipped)
+                ),
+                file=sys.stderr,
+            )
+        selected = [
+            (name, func)
+            for name, func in selected
+            if not getattr(func, "experimental", False)
+        ]
+        if not selected:
+            # Running zero checks and reporting "0 findings, clean" is the same
+            # failure mode as a scan where every check crashed.
+            usage_error(
+                "No checks left to run: every selected check is experimental. "
+                "Drop --strict, or name a non-experimental check with --handler."
+            )
+
+    # --host is only needed by the checks that wait on a callback.  Demanding a
+    # public VPS to run, say, the Groovy Console check was pure friction.
+    needs_host = any(getattr(func, "ssrf", False) for _, func in selected)
+    if needs_host and not args.host:
+        usage_error(
+            "You must specify the --host parameter: the selected checks detect "
+            "SSRF by waiting for a callback. Use --listhandlers to see which "
+            "checks need it.",
+        )
 
     if not preflight(args.url, proxy):
-        print("Seems that you provided bad URL. Try another one, bye.")
-        sys.exit(1337)
+        usage_error(
+            "Seems that you provided bad URL. Try another one, bye.",
+        )
 
-    httpd = run_detector(args.port)
+    httpd = run_detector(args.port) if needs_host else None
 
-    handlers_to_run = registered.values()
-    if args.handler:
-        handlers_to_run = []
+    sink = sys.stdout
+    handle = None
+    if args.output:
+        handle = open(args.output, "w", encoding="utf-8")
+        sink = handle
 
-        for name in args.handler:
-            handler_func = registered.get(name)
-            if handler_func:
-                handlers_to_run.append(handler_func)
+    findings = 0
+    failed_checks = 0
+    interrupted = False
+    # Findings are streamed as each check finishes, so a long scan shows progress
+    # and its results survive a crash or a Ctrl-C partway through.
+    # Use the port the listener actually bound. run_detector falls back to a
+    # free port when the requested one is unavailable (port 80 needs root), and
+    # telling the checks the requested port would point every callback at a dead
+    # port -- making all seven SSRF checks silently return nothing.
+    my_host = "{0}:{1}".format(
+        args.host, httpd.server_address[1] if httpd is not None else args.port
+    )
 
-    with concurrent.futures.ThreadPoolExecutor(args.workers) as tpe:
-        futures = []
-        for check in handlers_to_run:
-            my_host = "{0}:{1}".format(args.host, args.port)
-            futures.append(tpe.submit(check, args.url, my_host, args.debug, proxy))
+    tpe = concurrent.futures.ThreadPoolExecutor(args.workers)
+    try:
+        futures = {}
+        for name, check in selected:
+            futures[
+                tpe.submit(run_check, check, args.url, my_host, args.debug, proxy)
+            ] = name
 
         for future in concurrent.futures.as_completed(futures):
-            for finding in future.result():
-                print("[+] New Finding!!!")
-                print("\tName: {}".format(finding.name))
-                print("\tUrl: {}".format(finding.url))
-                print("\tDescription: {}\n\n".format(finding.description))
+            name = futures[future]
+            try:
+                results, requests_made = future.result()
+            except Exception:
+                # One broken check must never discard the findings the other
+                # 30-odd checks already produced.
+                failed_checks += 1
+                print(
+                    "[!] Check '{0}' failed and was skipped:".format(name),
+                    file=sys.stderr,
+                )
+                error("Exception while running a check", check=name)
+                continue
 
-    httpd.shutdown()
+            if not any(requests_made):
+                # Every request this check made failed, and checks swallow their
+                # own exceptions -- so this looks like "found nothing" unless we
+                # look at the tally. A dead target must not read as a clean scan.
+                failed_checks += 1
+                print(
+                    "[!] Check '{0}' made no successful request; treating it as "
+                    "inconclusive, not clean.".format(name),
+                    file=sys.stderr,
+                )
+                continue
+
+            for finding in results or []:
+                findings += 1
+                if getattr(registered.get(name), "experimental", False):
+                    # Never let an unvalidated result read as a confirmed one.
+                    finding = Finding(
+                        finding.name,
+                        finding.url,
+                        "[UNVERIFIED CHECK] " + finding.description,
+                    )
+                emit(finding, sink, args.format)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[!] Interrupted; cancelling outstanding checks.", file=sys.stderr)
+        # Not `with`: the context manager's __exit__ waits for every running
+        # check, so Ctrl-C would keep hammering the target for minutes (and the
+        # seven SSRF checks each sleep --ssrf-timeout) before the exit code
+        # finally appeared. cancel_futures drops the not-yet-started ones.
+        tpe.shutdown(wait=False, cancel_futures=True)
+    else:
+        tpe.shutdown(wait=True)
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+        if handle is not None:
+            handle.close()
+
+    # The summary always goes to stderr so that stdout stays either clean text or
+    # valid JSON that can be piped into another tool.
+    print(
+        "\n[*] {0} finding(s) from {1} check(s); {2} check(s) failed.".format(
+            findings, len(selected), failed_checks
+        ),
+        file=sys.stderr,
+    )
+
+    # 0 = clean, 1 = something was found, 2 = the scan did not complete. A run
+    # whose checks all crashed, or that was interrupted, must never be
+    # indistinguishable from a clean bill of health.
+    if interrupted or failed_checks:
+        return EXIT_INCOMPLETE
+    return EXIT_FINDINGS if findings else EXIT_CLEAN
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

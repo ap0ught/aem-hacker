@@ -1,0 +1,4 @@
+# Extra dependencies for aem_enum.py only.
+#     pip install -r requirements-enum.txt
+-r requirements.txt
+dpath>=2.2.0,<3.0.0
