@@ -46,6 +46,7 @@ import traceback
 import sys
 import argparse
 import base64
+import os
 import socket
 import threading
 import time
@@ -166,6 +167,82 @@ def parse_credential(value):
         ) from None
 
     return user, password
+
+
+CREDS_ENV_VAR = "AEM_HACKER_CREDS"
+
+
+def load_creds_file(path):
+    """Read ``user:password`` lines from *path*.
+
+    One per line; blank lines and ``#`` comments are ignored.  Never echoes the
+    contents, so a malformed line cannot spill a password into a log.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise CredentialError(
+            "Could not read credentials file: {0}".format(exc.strerror or exc)
+        ) from None
+
+    pairs = []
+    for number, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pairs.append(parse_credential(line))
+        except CredentialError as exc:
+            raise CredentialError(
+                "{0}, line {1}: {2}".format(path, number, exc)
+            ) from None
+    return pairs
+
+
+def warn_if_world_readable(path):
+    """Warn when a credentials file is readable by other users."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        print(
+            "[!] Credentials file {0} is readable by other users "
+            "(mode {1:o}); consider chmod 600.".format(path, mode & 0o777),
+            file=sys.stderr,
+        )
+
+
+def collect_credentials(creds_values, creds_file):
+    """Gather credentials from --creds, --creds-file and the environment.
+
+    They combine: a password on the command line is visible in ``ps``,
+    ``/proc/*/cmdline`` and shell history, so the file and environment routes
+    exist for when that matters.
+    """
+    pairs = []
+    for value in creds_values or []:
+        pairs.append(parse_credential(value))
+
+    if creds_file:
+        warn_if_world_readable(creds_file)
+        pairs.extend(load_creds_file(creds_file))
+
+    from_env = os.environ.get(CREDS_ENV_VAR)
+    if from_env:
+        for line in from_env.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pairs.append(parse_credential(line))
+
+    seen = set()
+    out = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
 
 
 def primary_auth_header(fallback=None):
@@ -480,7 +557,9 @@ def http_request_multipart(
 
     if request_delay:
         time.sleep(request_delay)
-    resp = requests.request(
+    # On the shared session, so this does not pay a fresh TCP+TLS handshake for
+    # the one check that uploads a payload.
+    resp = get_session().request(
         method,
         url,
         files=data,
@@ -1065,16 +1144,19 @@ def create_new_nodes(base_url, my_host, debug=False, proxy=None):
                     url=url,
                 )
 
-    for path, creds in itertools.product(POSTSERVLET2, CREDS):
+    # This check keeps its own (smaller) credential set; --creds is appended
+    # rather than replacing it, so the default probe list is unchanged.
+    creds_list = [parse_credential(c) for c in CREDS] + list(credentials)
+
+    for path, creds in itertools.product(POSTSERVLET2, creds_list):
+        username = username_of(creds)
         url = normalize_url(base_url, path)
         try:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Referer": base_url,
-                "Authorization": "Basic {}".format(
-                    base64.b64encode(creds.encode()).decode()
-                ),
             }
+            headers.update(basic_auth_header(creds))
             data = "a=b"
             resp = http_request(
                 url, "POST", data=data, additional_headers=headers, proxy=proxy
@@ -1088,7 +1170,7 @@ def create_new_nodes(base_url, my_host, debug=False, proxy=None):
                     "CreateJCRNodes",
                     url,
                     'It\'s possible to create new JCR nodes using POST Servlet as "{0}" user. '
-                    "You might get persistent XSS or RCE.".format(creds),
+                    "You might get persistent XSS or RCE.".format(username),
                 )
                 results.append(f)
                 break
@@ -1150,17 +1232,18 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
     )
 
     results = []
-    for path, creds in itertools.product(POSTSERVLET, CREDS):
-        path = path.format(creds.split(":")[0])
+    creds_list = [parse_credential(c) for c in CREDS] + list(credentials)
+
+    for path, creds in itertools.product(POSTSERVLET, creds_list):
+        username = username_of(creds)
+        path = path.format(username)
         url = normalize_url(base_url, path)
         try:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Referer": base_url,
-                "Authorization": "Basic {}".format(
-                    base64.b64encode(creds.encode()).decode()
-                ),
             }
+            headers.update(basic_auth_header(creds))
             data = "a=b"
             resp = http_request(
                 url, "POST", data=data, additional_headers=headers, proxy=proxy
@@ -1175,7 +1258,7 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
                     url,
                     'It\'s possible to create new JCR nodes using POST Servlet. As Geometrixx user "{0}". '
                     "You might get persistent XSS or perform other attack by accessing servlets registered by Resource Type.".format(
-                        creds
+                        username
                     ),
                 )
                 results.append(f)
@@ -1194,7 +1277,6 @@ def create_new_nodes2(base_url, my_host, debug=False, proxy=None):
 @register("loginstatus_servlet")
 def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed LoginStatusServlet and test default credentials against it."""
-    global CREDS
 
     r = random_string(3)
     LOGINSTATUS = itertools.product(
@@ -1288,7 +1370,6 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
 @register("currentuser_servlet")
 def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed CurrentUserServlet and test credentials against it."""
-    global CREDS
 
     r = random_string(3)
     CURRENTUSER = itertools.product(
@@ -1378,7 +1459,6 @@ def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
 @register("userinfo_servlet")
 def exposed_userinfo_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed UserInfoServlet and test default credentials against it."""
-    global CREDS
 
     r = random_string(3)
     USERINFO = itertools.product(
@@ -1495,7 +1575,8 @@ def exposed_felix_console(base_url, my_host, debug=False, proxy=None):
     results = []
     for path in FELIXCONSOLE:
         url = normalize_url(base_url, path)
-        headers = {"Authorization": "Basic YWRtaW46YWRtaW4="}
+        # A supplied credential, else the admin:admin probe this check always made.
+        headers = primary_auth_header(fallback=("admin", "admin"))
         try:
             resp = http_request(
                 url, additional_headers=headers, proxy=proxy, debug=debug
@@ -2829,8 +2910,9 @@ def exposed_acs_tools(base_url, my_host, debug=False, proxy=None):
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": base_url,
-            "Authorization": "Basic YWRtaW46YWRtaW4=",
         }
+        # A supplied credential, else the admin:admin probe this check always made.
+        headers.update(primary_auth_header(fallback=("admin", "admin")))
         try:
             resp = http_request(
                 url,
@@ -3444,6 +3526,13 @@ def parse_args():
         help="seconds to wait for SSRF callbacks to arrive",
     )
     parser.add_argument(
+        "--creds-file",
+        metavar="PATH",
+        help="read credentials from a file, one 'user:password' per line "
+        "('#' comments and blank lines allowed). Preferred over --creds, "
+        "which exposes the password in ps and shell history",
+    )
+    parser.add_argument(
         "--creds",
         action="append",
         metavar="USER:PASS",
@@ -3567,19 +3656,25 @@ def main():
                     )
                 )
                 sys.exit(1)
+            # Same reasoning as --creds: this value is interpolated into a request
+            # header, and one containing CR/LF could split the request.
+            if any(ch in header for ch in "\r\n\x00"):
+                print(
+                    "Header names and values must not contain CR, LF or NUL "
+                    "characters."
+                )
+                sys.exit(1)
             extra_headers[header_data[0].strip()] = header_data[1].strip()
     else:
         extra_headers = {}
 
-    credentials = []
-    for value in args.creds or []:
-        try:
-            credentials.append(parse_credential(value))
-        except CredentialError as exc:
-            # The password is never echoed back, so a mistyped value cannot leak
-            # into a terminal scrollback or a CI log.
-            print("Bad --creds value: {0}".format(exc), file=sys.stderr)
-            sys.exit(1)
+    try:
+        credentials = collect_credentials(args.creds, args.creds_file)
+    except CredentialError as exc:
+        # The password is never echoed back, so a mistyped value cannot leak
+        # into a terminal scrollback or a CI log.
+        print("Bad credential: {0}".format(exc), file=sys.stderr)
+        sys.exit(1)
 
     if not args.url:
         print("You must specify the -u parameter, bye.")
@@ -3613,6 +3708,15 @@ def main():
             for name, func in selected
             if not getattr(func, "experimental", False)
         ]
+        if not selected:
+            # Running zero checks and reporting "0 findings, clean" is the same
+            # failure mode as a scan where every check crashed.
+            print(
+                "No checks left to run: every selected check is experimental. "
+                "Drop --strict, or name a non-experimental check with --handler.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # --host is only needed by the checks that wait on a callback.  Demanding a
     # public VPS to run, say, the Groovy Console check was pure friction.

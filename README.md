@@ -79,6 +79,8 @@ optional arguments:
   --delay DELAY         seconds between requests
   --ssrf-timeout SSRF_TIMEOUT
                         seconds to wait for SSRF callbacks to arrive
+  --creds-file PATH     read credentials from a file, one 'user:password' per
+                        line; preferred, keeps the password off the command line
   --creds USER:PASS     credential for checks that need an authenticated
                         session; repeatable
   --format {text,json}  output format; 'json' is one finding per line
@@ -115,8 +117,24 @@ redirect) and the authenticated product-info probe will send it:
 python3 aem_hacker.py -u https://aem.webapp --host your_vps --creds author:author
 ```
 
-The password is never written to a finding, to stdout, or to an error message.
-With no `--creds` every check behaves exactly as before. Only the first
+Because a password on the command line is visible in `ps`, `/proc/*/cmdline`
+and shell history, there are two routes that keep it off the command line:
+
+```
+printf 'author:letmein\n' > ~/.aem-creds && chmod 600 ~/.aem-creds
+python3 aem_hacker.py -u https://aem.webapp --creds-file ~/.aem-creds
+# or:
+AEM_HACKER_CREDS='author:letmein' python3 aem_hacker.py -u https://aem.webapp
+```
+
+`--creds-file` takes one `user:password` per line (`#` comments and blank lines
+allowed) and warns if the file is readable by other users. All three sources
+combine, and supplied credentials are *added to* the built-in default list rather
+than replacing it.
+
+The password is never written to a finding, to stdout, or to an error message —
+only the username is reported. With no credential flags at all, every check
+behaves exactly as before. Only the first
 credential is used for session-style probes, so supplying more does not multiply
 the request count; the default-credential checks try all of them in place of
 their built-in list.

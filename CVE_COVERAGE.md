@@ -76,6 +76,20 @@ primitive.
 python3 aem_hacker.py -u https://aem.webapp --host your_vps --creds author:author
 ```
 
+A password on the command line is visible in `ps`, `/proc/*/cmdline` and shell
+history, so two off-the-command-line routes are also accepted — they combine
+with `--creds`:
+
+```
+chmod 600 ~/.aem-creds          # one 'user:password' per line
+python3 aem_hacker.py -u https://aem.webapp --creds-file ~/.aem-creds
+AEM_HACKER_CREDS='author:letmein' python3 aem_hacker.py -u https://aem.webapp
+```
+
+`--creds-file` warns when the file is readable by other users. A credential
+outside ISO-8859-1 is rejected, because RFC 7617 Basic authentication cannot
+transmit it (and UTF-8 would send mojibake that silently never validates).
+
 Which checks use it:
 
 | Check | Without `--creds` | With `--creds` |

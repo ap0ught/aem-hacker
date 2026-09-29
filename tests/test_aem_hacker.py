@@ -14,7 +14,9 @@ The tests fall into three groups:
     safe to run against a target that exposes nothing.
 """
 
+import concurrent.futures
 import contextlib
+import copy
 import io
 import json
 import os
@@ -60,6 +62,41 @@ def no_sleep(_seconds):
 no_sleep.calls = []
 
 
+class GlobalIsolationTestCase(unittest.TestCase):
+    """Restores aem_hacker's module globals around every test.
+
+    ``d``, ``token``, ``credentials``, ``extra_headers`` and ``request_delay`` are
+    module-level and outlive a single check, and main() mutates extra_headers in
+    place. Alphabetical class ordering was making the leaks benign by luck; this
+    makes the suite order-independent.
+    """
+
+    _GLOBALS = (
+        "d",
+        "token",
+        "credentials",
+        "extra_headers",
+        "request_delay",
+        "ssrf_timeout",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {}
+        for name in self._GLOBALS:
+            self._saved[name] = copy.copy(getattr(aem_hacker, name))
+        aem_hacker.d = {}
+        aem_hacker.token = "TESTTOKEN"
+        aem_hacker.credentials = []
+        aem_hacker.extra_headers = {}
+        aem_hacker.request_delay = 0
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self._saved.items():
+            setattr(aem_hacker, name, value)
+
+
 def free_port():
     """Ask the OS for an unused TCP port and release it again."""
     import socket
@@ -75,14 +112,25 @@ def run_handler(handler, mock_target, my_host=None):
         return handler(mock_target.url, my_host or "127.0.0.1:1", False, {})
 
 
-def run_all(mock_target, my_host=None):
-    """Run every registered check, returning (name, findings-or-exception)."""
+def run_all(mock_target, my_host=None, workers=8):
+    """Run every registered check, returning (name, findings-or-exception).
+
+    The checks are independent and the tool itself runs them in a thread pool, so
+    the harness does too. Sequentially this was ~190s per full sweep, which
+    dominated the suite's runtime.
+    """
     out = {}
-    for name, handler in aem_hacker.registered.items():
-        try:
-            out[name] = run_handler(handler, mock_target, my_host)
-        except Exception as exc:  # a check must never take the scan down
-            out[name] = exc
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        futures = {
+            pool.submit(run_handler, handler, mock_target, my_host): name
+            for name, handler in aem_hacker.registered.items()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                out[name] = future.result()
+            except Exception as exc:  # a check must never take the scan down
+                out[name] = exc
     return out
 
 
@@ -91,7 +139,7 @@ def run_all(mock_target, my_host=None):
 # ---------------------------------------------------------------------------
 
 
-class TestCheckContract(unittest.TestCase):
+class TestCheckContract(GlobalIsolationTestCase):
     def test_no_silently_dead_checks(self):
         """Checks must be registered, not merely defined.
 
@@ -133,6 +181,9 @@ class TestCheckContract(unittest.TestCase):
             "credentials_to_probe",
             "primary_auth_header",
             "username_of",
+            "load_creds_file",
+            "warn_if_world_readable",
+            "collect_credentials",
         }
         with open(aem_hacker.__file__) as fh:
             tree = ast.parse(fh.read())
@@ -188,7 +239,7 @@ class TestCheckContract(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCrashIsolation(unittest.TestCase):
+class TestCrashIsolation(GlobalIsolationTestCase):
     """A single misbehaving check must not discard the whole scan."""
 
     def _run_main(self, registered, argv):
@@ -325,7 +376,7 @@ class TestCrashIsolation(unittest.TestCase):
         )
 
 
-class TestLoginSignalCorrectness(unittest.TestCase):
+class TestLoginSignalCorrectness(GlobalIsolationTestCase):
     """The credential checks must not lose, or invent, a login signal.
 
     An earlier revision replaced each check's own documented positive signal with
@@ -390,7 +441,7 @@ class TestLoginSignalCorrectness(unittest.TestCase):
         )
 
 
-class TestExitStatusHonesty(unittest.TestCase):
+class TestExitStatusHonesty(GlobalIsolationTestCase):
     """A scan that did not complete must not look like a clean one."""
 
     def _run_main(self, registered, argv=None):
@@ -446,7 +497,7 @@ class TestExitStatusHonesty(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
-class TestSsrfCallbackPort(unittest.TestCase):
+class TestSsrfCallbackPort(GlobalIsolationTestCase):
     """The checks must be told the port the listener actually bound.
 
     run_detector() falls back to a free port when --port is unavailable (the
@@ -499,7 +550,7 @@ class TestSsrfCallbackPort(unittest.TestCase):
         )
 
 
-class TestDefaultCredentialsFalsePositive(unittest.TestCase):
+class TestDefaultCredentialsFalsePositive(GlobalIsolationTestCase):
     """A rejected login must never be reported as 'default credentials work'."""
 
     def test_rejected_login_is_not_a_default_credential_finding(self):
@@ -582,7 +633,7 @@ class TestDefaultCredentialsFalsePositive(unittest.TestCase):
         self.assertNotIn("admin:admin", cred_hits[0].description)
 
 
-class TestRequestPacing(unittest.TestCase):
+class TestRequestPacing(GlobalIsolationTestCase):
     """--delay is documented as 'seconds between requests'."""
 
     def setUp(self):
@@ -641,7 +692,7 @@ class TestRequestPacing(unittest.TestCase):
         )
 
 
-class TestSsrfDetection(unittest.TestCase):
+class TestSsrfDetection(GlobalIsolationTestCase):
     """The SSRF callback chain must still work end to end."""
 
     def setUp(self):
@@ -710,7 +761,7 @@ class TestSsrfDetection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDetections(unittest.TestCase):
+class TestDetections(GlobalIsolationTestCase):
     def test_querybuilder_exposure_is_reported(self):
         body = b'{"success":true,"hits":[],"results":[]}'
         with MockAEM(
@@ -758,7 +809,7 @@ class TestDetections(unittest.TestCase):
         self.assertEqual(findings, [], "reported an open redirect that does not exist")
 
 
-class TestCredentialsFlag(unittest.TestCase):
+class TestCredentialsFlag(GlobalIsolationTestCase):
     """--creds makes the PR:L half of Adobe's CVE surface reachable.
 
     Most AEM CVEs are low-privilege or need user interaction, so an anonymous
@@ -952,6 +1003,88 @@ class TestCredentialsFlag(unittest.TestCase):
                     "the password leaked for {0!r}: {1}".format(value, exc),
                 )
 
+    def test_creds_file_is_parsed(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("# comment\n\n  alice:pw1  \nbob:a:b:c\n")
+            path = fh.name
+        os.chmod(path, 0o600)
+        try:
+            pairs = aem_hacker.collect_credentials(None, path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(pairs, [("alice", "pw1"), ("bob", "a:b:c")])
+
+    def test_creds_file_combines_with_flag_and_environment(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("alice:pw1\n")
+            path = fh.name
+        os.chmod(path, 0o600)
+        try:
+            with mock.patch.dict(os.environ, {aem_hacker.CREDS_ENV_VAR: "dave:pw4"}):
+                pairs = aem_hacker.collect_credentials(["carol:pw3"], path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(
+            pairs,
+            [("carol", "pw3"), ("alice", "pw1"), ("dave", "pw4")],
+            "the three credential sources did not combine in order",
+        )
+
+    def test_a_malformed_file_line_does_not_echo_the_password(self):
+        import tempfile
+
+        secret = self.SECRET
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("alice:" + secret + "\nbroken\n")
+            path = fh.name
+        try:
+            with self.assertRaises(aem_hacker.CredentialError) as ctx:
+                aem_hacker.collect_credentials(None, path)
+        finally:
+            os.unlink(path)
+        self.assertIn("line 2", str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
+
+    def test_missing_creds_file_is_reported_clearly(self):
+        with self.assertRaises(aem_hacker.CredentialError) as ctx:
+            aem_hacker.collect_credentials(None, "/nonexistent/nope.txt")
+        self.assertIn("Could not read credentials file", str(ctx.exception))
+
+    def test_world_readable_creds_file_is_flagged(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("alice:pw1\n")
+            path = fh.name
+        os.chmod(path, 0o644)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                aem_hacker.collect_credentials(None, path)
+        finally:
+            os.unlink(path)
+        self.assertIn("readable by other users", err.getvalue())
+        self.assertIn("chmod 600", err.getvalue())
+
+    def test_restrictive_creds_file_is_not_flagged(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("alice:pw1\n")
+            path = fh.name
+        os.chmod(path, 0o600)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                aem_hacker.collect_credentials(None, path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(err.getvalue(), "")
+
     def test_rejects_characters_basic_auth_cannot_transmit(self):
         """RFC 7617 is ISO-8859-1; UTF-8 would send mojibake that never validates."""
         with self.assertRaises(aem_hacker.CredentialError):
@@ -997,7 +1130,7 @@ class TestCredentialsFlag(unittest.TestCase):
             self.assertNotIn(self.SECRET, out.getvalue() + err.getvalue())
 
 
-class TestCveCoverageDoc(unittest.TestCase):
+class TestCveCoverageDoc(GlobalIsolationTestCase):
     """CVE_COVERAGE.md must describe the checks that actually exist.
 
     The two dead checks this suite guards against were dead because the
@@ -1120,7 +1253,7 @@ class TestCveCoverageDoc(unittest.TestCase):
             )
 
 
-class TestSlurper(unittest.TestCase):
+class TestSlurper(GlobalIsolationTestCase):
     """aem_slurper.py must not confuse "could not read" with "nothing there".
 
     It parsed any response as a child list, so a 401/403/404 — or a dispatcher
@@ -1203,7 +1336,202 @@ class TestSlurper(unittest.TestCase):
             conn.close()
 
 
-class TestSiblingScripts(unittest.TestCase):
+class TestCredsPropagation(GlobalIsolationTestCase):
+    """--creds must reach every check that authenticates, and never be printed."""
+
+    SECRET = "sup3rs3cr3t"
+
+    # Satisfies the exposure gate of every credential-gated check (loginstatus
+    # looks for "authenticated", userinfo for "userID", currentuser for
+    # "authorizableId") while being an outright rejection, so nothing is reported.
+    GATE_PASSING_BODY = (
+        b'{"authenticated": false, "userID": "", "authorizableId": "anonymous"}'
+    )
+
+    def _seen_auth(self, handler_name, creds):
+        seen = []
+
+        def route(method, path, headers):
+            seen.append(headers.get("Authorization"))
+            return self.GATE_PASSING_BODY
+
+        with scanner(credentials=creds):
+            with MockAEM(routes=[Route(r".*", body=route)]) as target:
+                run_handler(aem_hacker.registered[handler_name], target)
+        return seen
+
+    def test_every_authenticating_check_honours_creds(self):
+        """No check should still be hardcoded to admin:admin."""
+        checks = [
+            "create_new_nodes",
+            "create_new_nodes2",
+            "felix_console",
+            "acs_tools",
+            "version_disclosure",
+            "currentuser_servlet",
+            "userinfo_servlet",
+            "loginstatus_servlet",
+        ]
+        with scanner(credentials=[("bob", self.SECRET)]):
+            for name in checks:
+                with self.subTest(check=name):
+                    seen = self._seen_auth(name, [("bob", self.SECRET)])
+                    self.assertTrue(seen, f"{name} sent no requests")
+                    import base64
+
+                    expected = (
+                        "Basic "
+                        + base64.b64encode(
+                            "bob:{}".format(self.SECRET).encode()
+                        ).decode()
+                    )
+                    self.assertIn(
+                        expected,
+                        seen,
+                        f"{name} did not authenticate with the supplied credential",
+                    )
+
+    def test_create_new_nodes_reports_only_the_username(self):
+        """The finding used to embed the whole user:pass string."""
+        import base64
+
+        bob = (
+            "Basic " + base64.b64encode("bob:{}".format(self.SECRET).encode()).decode()
+        )
+
+        def route(method, path, headers):
+            # Only the supplied credential is accepted, so the check has to walk
+            # past the whole built-in list to reach it.
+            if headers.get("Authorization") == bob:
+                return b"<html><table><td>Parent Location</td></table></html>"
+            return b"<html>nope</html>"
+
+        with scanner(credentials=[("bob", self.SECRET)]):
+            with MockAEM(routes=[Route(r".*", body=route)]) as target:
+                result = run_handler(aem_hacker.registered["create_new_nodes"], target)
+        self.assertTrue(result, "the working credential was not reported at all")
+        report = " ".join(f.description for f in result)
+        self.assertNotIn(self.SECRET, report, "the password leaked into a finding")
+        self.assertIn("bob", report)
+
+    def test_create_new_nodes_keeps_its_own_default_set(self):
+        """--creds is appended; this check's built-in list must not change.
+
+        It deliberately uses a smaller list than the global CREDS tuple, so it is
+        also a check that the global one has not leaked in.
+        """
+        import base64
+
+        seen = []
+
+        def route(method, path, headers):
+            seen.append(headers.get("Authorization"))
+            return b"<html>nothing</html>"
+
+        with scanner(credentials=[]):
+            with MockAEM(routes=[Route(r".*", body=route)]) as target:
+                run_handler(aem_hacker.registered["create_new_nodes"], target)
+
+        own = {
+            "Basic " + base64.b64encode(c.encode()).decode()
+            for c in ("admin:admin", "author:author", "admin:password")
+        }
+        # The global list also contains grios:password; this check must not use it.
+        global_only = {
+            "Basic " + base64.b64encode(c.encode()).decode() for c in aem_hacker.CREDS
+        } - own
+        used = {a for a in seen if a}
+
+        self.assertTrue(used, "no authenticated requests were made")
+        self.assertTrue(
+            used.issubset(own),
+            "create_new_nodes probed credentials outside its own list: {0}".format(
+                sorted(used - own)
+            ),
+        )
+        self.assertFalse(
+            used & global_only,
+            "the global default list leaked into this check: {0}".format(
+                sorted(used & global_only)
+            ),
+        )
+
+    def test_no_hardcoded_admin_admin_remains_in_source(self):
+        import base64
+
+        blob = base64.b64encode(b"admin:admin").decode()
+        with open(aem_hacker.__file__) as fh:
+            source = fh.read()
+        self.assertNotIn(
+            blob,
+            source,
+            "a hardcoded admin:admin Authorization header is still in the source",
+        )
+
+
+class TestHeaderValidation(GlobalIsolationTestCase):
+    def test_header_with_crlf_is_rejected(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "aem_hacker.py",
+                "-u",
+                "http://x",
+                "--host",
+                "1.2.3.4",
+                "-H",
+                "X-A: v\r\nX-Injected: 1",
+            ],
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            with self.assertRaises(SystemExit):
+                aem_hacker.main()
+        self.assertIn("CR, LF or NUL", out.getvalue() + err.getvalue())
+
+
+class TestStrictZeroChecks(GlobalIsolationTestCase):
+    def test_stripping_every_check_is_an_error(self):
+        """Zero checks must not be reported as a clean scan."""
+
+        def experimental_check(base_url, my_host, debug=False, proxy=None):
+            return []
+
+        experimental_check.experimental = True
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            aem_hacker, "registered", {"exp": experimental_check}
+        ), mock.patch.object(
+            sys,
+            "argv",
+            [
+                "aem_hacker.py",
+                "-u",
+                "http://x",
+                "--host",
+                "1.2.3.4",
+                "--strict",
+            ],
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                aem_hacker.main()
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("No checks left to run", err.getvalue())
+
+
+class TestSiblingScripts(GlobalIsolationTestCase):
     """The other scripts in the repo have their own silent-failure modes.
 
     aem_enum.py once called ``dpath.util.search()`` while only importing
@@ -1275,7 +1603,7 @@ class TestSiblingScripts(unittest.TestCase):
         )
 
 
-class TestHelpers(unittest.TestCase):
+class TestHelpers(GlobalIsolationTestCase):
     def test_normalize_url_never_doubles_slashes(self):
         self.assertEqual(aem_hacker.normalize_url("http://a/", "/b"), "http://a/b")
         self.assertEqual(aem_hacker.normalize_url("http://a", "/b"), "http://a/b")
