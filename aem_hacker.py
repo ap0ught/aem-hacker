@@ -428,7 +428,7 @@ class Detector(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def register(name, ssrf=False, experimental=False):
+def register(name, ssrf=False, experimental=False, default=True):
     """Register a check function under *name*.
 
     ``ssrf=True`` marks a check that cannot conclude anything without a reachable
@@ -440,11 +440,18 @@ def register(name, ssrf=False, experimental=False):
     to be wrong during an audit (see CVE_COVERAGE.md).  These still run by
     default, but their findings are labelled and ``--strict`` skips them, so a
     report never presents an unverified result as a confirmed one.
+
+    ``default=False`` makes a check reachable but opt-in: it appears in
+    ``--listhandlers`` and runs when named with ``--handler``, but is left out of
+    a plain run.  This is for a check the maintainer deliberately took out of the
+    default sweep -- it must not be silently lost, but the default blast radius
+    is the maintainer's call, not the reader's.
     """
 
     def decorator(func):
         func.ssrf = ssrf
         func.experimental = experimental
+        func.default = default
         registered[name] = func
         return func
 
@@ -1455,7 +1462,7 @@ def exposed_loginstatus_servlet(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("currentuser_servlet")
+@register("currentuser_servlet", default=False)
 def exposed_currentuser_servlet(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed CurrentUserServlet and test credentials against it."""
 
@@ -1912,7 +1919,7 @@ def exposed_crxde_crx(base_url, my_host, debug=False, proxy=None):
     return results
 
 
-@register("reports")
+@register("reports", default=False)
 def exposed_reports(base_url, my_host, debug=False, proxy=None):
     """Check for an exposed Disk Usage report."""
     r = random_string(3)
@@ -3723,7 +3730,16 @@ def main():
     ssrf_timeout = args.ssrf_timeout
 
     if args.listhandlers:
-        print("[*] Available handlers: {0}".format(list(registered.keys())))
+        for name, func in registered.items():
+            marks = []
+            if not getattr(func, "default", True):
+                marks.append("opt-in, use --handler")
+            if getattr(func, "ssrf", False):
+                marks.append("needs --host")
+            if getattr(func, "experimental", False):
+                marks.append("experimental, skipped by --strict")
+            suffix = "  [{0}]".format("; ".join(marks)) if marks else ""
+            print("{0}{1}".format(name, suffix))
         sys.exit(0)
 
     if args.proxy:
@@ -3780,7 +3796,23 @@ def main():
             )
         selected = [(name, registered[name]) for name in args.handler]
     else:
-        selected = list(registered.items())
+        # Opt-in checks are reachable but not part of a plain run. Announce what
+        # was left out: silently narrowing a scan is the failure mode this tool
+        # has been fixing all along.
+        opt_in = [n for n, f in registered.items() if not getattr(f, "default", True)]
+        if opt_in:
+            print(
+                "[*] Not running {0} opt-in check(s) by default: {1}\n"
+                "    Run one with: --handler <name>".format(
+                    len(opt_in), ", ".join(sorted(opt_in))
+                ),
+                file=sys.stderr,
+            )
+        selected = [
+            (name, func)
+            for name, func in registered.items()
+            if getattr(func, "default", True)
+        ]
 
     if args.strict:
         skipped = [

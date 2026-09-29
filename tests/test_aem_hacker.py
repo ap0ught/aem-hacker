@@ -166,7 +166,9 @@ class TestCheckContract(GlobalIsolationTestCase):
 
         Regression: the @register line for these two was commented out, so the
         README advertised checks (CurrentUserServlet, Reports) that could never
-        run and --listhandlers never mentioned them.
+        run and --listhandlers never mentioned them. They are registered again,
+        and a separate test pins that they stay opt-in (see
+        TestOptInChecks) -- reachable, but not in the default sweep.
         """
         for name in ("currentuser_servlet", "reports"):
             self.assertIn(name, aem_hacker.registered, f"{name} check is dead code")
@@ -1160,6 +1162,139 @@ class TestCredentialsFlag(GlobalIsolationTestCase):
                     aem_hacker.main()
             self.assertNotEqual(ctx.exception.code, 0)
             self.assertNotIn(self.SECRET, out.getvalue() + err.getvalue())
+
+
+class TestOptInChecks(GlobalIsolationTestCase):
+    """Two checks are reachable but deliberately out of the default sweep.
+
+    git history: a contributor added currentuser_servlet and reports enabled in
+    2019, and the maintainer commented both out in 2020-01-03 (0dbb87d,
+    "Tooling update") -- in the same commit where they registered four other
+    checks. currentuser_servlet brute-forces credentials, which its two
+    neighbours (loginstatus_servlet, userinfo_servlet) already do and which
+    stayed enabled, so the disabling reads as a deliberate de-duplication.
+
+    So the real defect was the documentation claiming three checks where the
+    author ships two. Re-enabling the third by default would override that
+    judgement; making them reachable but opt-in fixes the doc bug without
+    changing the default blast radius.
+    """
+
+    OPT_IN = ("currentuser_servlet", "reports")
+
+    def test_both_are_reachable(self):
+        for name in self.OPT_IN:
+            self.assertIn(name, aem_hacker.registered)
+            self.assertTrue(callable(aem_hacker.registered[name]))
+
+    def test_both_are_opt_in(self):
+        for name in self.OPT_IN:
+            self.assertFalse(
+                getattr(aem_hacker.registered[name], "default", True),
+                f"{name} is back in the default sweep",
+            )
+
+    def test_every_other_check_is_still_in_the_default_sweep(self):
+        opted_in = {
+            n
+            for n, f in aem_hacker.registered.items()
+            if not getattr(f, "default", True)
+        }
+        self.assertEqual(opted_in, set(self.OPT_IN), "the opt-in set changed")
+
+    def test_naming_one_with_handler_runs_it(self):
+        def with_target(reg, argv):
+            out, err = io.StringIO(), io.StringIO()
+            code = 0
+            with mock.patch.object(
+                aem_hacker,
+                "registered",
+                {k: with_liveness(v) for k, v in reg.items()},
+            ), mock.patch.object(
+                sys, "argv", ["aem_hacker.py"] + argv
+            ), mock.patch.object(
+                aem_hacker, "preflight", lambda *a, **k: True
+            ), mock.patch.object(
+                aem_hacker, "run_detector", lambda p: None
+            ), mock.patch.object(
+                aem_hacker.time, "sleep", no_sleep
+            ), contextlib.redirect_stdout(
+                out
+            ), contextlib.redirect_stderr(
+                err
+            ):
+                try:
+                    code = aem_hacker.main() or 0
+                except SystemExit as exc:
+                    code = exc.code or 0
+            return code, out.getvalue(), err.getvalue()
+
+        ran = []
+
+        def opt_in_check(base_url, my_host, debug=False, proxy=None):
+            ran.append(1)
+            return [aem_hacker.Finding("Found", base_url, "opt-in check ran")]
+
+        opt_in_check.default = False
+        opt_in_check.ssrf = False
+        opt_in_check.experimental = False
+
+        with MockAEM() as target:
+            code, out, err = with_target(
+                {"mine": opt_in_check},
+                ["-u", target.url, "--host", "1.2.3.4", "--handler", "mine"],
+            )
+        self.assertEqual(len(ran), 1, "--handler did not run the opt-in check")
+        self.assertIn("opt-in check ran", out)
+
+    def test_a_plain_run_says_what_it_left_out(self):
+        """Silently narrowing a scan is the failure mode this tool keeps fixing."""
+
+        def make(default):
+            # Distinct function objects: sharing one would share its attributes.
+            def check(base_url, my_host, debug=False, proxy=None):
+                return []
+
+            check.default = default
+            check.ssrf = False
+            check.experimental = False
+            return check
+
+        registry = {
+            "normal": make(True),
+            "also_normal": make(True),
+            "the_opt_in_one": make(False),
+        }
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(aem_hacker, "registered", registry), mock.patch.object(
+            sys,
+            "argv",
+            [
+                "aem_hacker.py",
+                "-u",
+                "http://x",
+                "--host",
+                "1.2.3.4",
+            ],
+        ), mock.patch.object(
+            aem_hacker, "preflight", lambda *a, **k: True
+        ), mock.patch.object(
+            aem_hacker, "run_detector", lambda p: None
+        ), mock.patch.object(
+            aem_hacker.time, "sleep", no_sleep
+        ), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            try:
+                aem_hacker.main()
+            except SystemExit:
+                pass
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("opt-in", combined, "a narrowed scan said nothing")
+        self.assertIn("the_opt_in_one", combined, "the excluded check was not named")
 
 
 class TestCveCoverageDoc(GlobalIsolationTestCase):

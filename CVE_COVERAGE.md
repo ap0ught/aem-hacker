@@ -26,12 +26,32 @@ check you will find:
 
 ## ⚠️ Provenance and audit status
 
-**Two checks were dead code.** `currentuser_servlet` and `reports` had their
-`@register` decorator commented out, so the README advertised them as
-implemented while they could never run and `--listhandlers` never listed them.
-They are registered again and documented below. A regression test now fails if
-any check becomes unreachable, and another fails if this document and the code
-disagree about which checks exist.
+**Two checks were documented as implemented but were unreachable.**
+`currentuser_servlet` and `reports` had their `@register` decorator commented out,
+so the README claimed them while they could never run. They are registered again
+and documented below — but as **opt-in**, and the reason matters:
+
+| | date | what |
+|---|---|---|
+| `ByQwert` added both, enabled | 2019-03-16 | `b65466a` |
+| `0ang3el` commented both out | 2020-01-03 | `0dbb87d` "Tooling update" — in the same commit that registered four *other* checks |
+
+So this was not an accident. `currentuser_servlet` brute-forces credentials, which
+its two neighbours `loginstatus_servlet` and `userinfo_servlet` already do and
+which stayed enabled — the author kept two of the three, which reads as a
+deliberate de-duplication. `reports` is low-value information disclosure.
+
+**The defect was therefore in the documentation, not the code.** Claiming three
+checks where the author ships two is wrong; silently re-adding the third to the
+default sweep would override the maintainer's judgement. Both are now registered,
+listed by `--listhandlers`, documented here, and runnable with
+`--handler <name>` — but excluded from a plain run, which also announces what it
+left out. Re-enabling them by default is a one-line change
+(`@register(..., default=True)`) if you disagree with the de-duplication.
+
+A regression test now fails if any check becomes unreachable, another fails if
+this document and the code disagree about which checks exist, and a third pins
+that these two stay opt-in.
 
 **Every CVE attribution in the five checks added by the Copilot PRs was wrong.**
 Each was checked against the vendor bulletin it cited, and in all five cases the
@@ -101,9 +121,9 @@ Which checks use it:
 Properties worth knowing:
 
 * With no `--creds`, the credential checks probe **the same set of credentials
-  as before** and the anonymous path is unchanged. Note that two checks
-  (`currentuser_servlet`, `reports`) are new to the default scan on this branch:
-  they existed but were unreachable.
+  as before** and the anonymous path is unchanged. No check is new to the default
+  sweep: `currentuser_servlet` and `reports` are reachable but opt-in, as the
+  maintainer intended.
 * Supplied credentials are **added to** the built-in default-credential list, not
   substituted for it — using `--creds` to reach a `PR:L` check does not silently
   disable "AEM with default credentials" detection.
@@ -520,9 +540,12 @@ curl -sk 'https://TARGET/libs/cq/security/userinfo.json' \
 | CVSS | ~7.5 (High) |
 | Affected versions | AEM 6.x |
 
-> **This check was dead code until recently.** Its `@register` decorator was
-> commented out, so the README listed it as implemented while it could never
-> run. It is registered again and now covered by tests.
+> **Opt-in, not in the default sweep.** Its `@register` decorator was commented
+> out, so the README listed it as implemented while it could never run. It is
+> registered again and covered by tests, but deliberately left out of a plain
+> run: `loginstatus_servlet` and `userinfo_servlet` already perform this
+> brute-force and the author kept two of the three. Run it with
+> `--handler currentuser_servlet`.
 
 **Why it exists**
 `/libs/granite/security/currentuser.json` returns the authenticated principal's
@@ -560,8 +583,9 @@ curl -sk 'https://TARGET/libs/granite/security/currentuser.json' \
 | CVSS | ~5.3 (Medium) |
 | Affected versions | AEM 6.x |
 
-> **This check was dead code until recently**, for the same reason as
-> `currentuser_servlet`.
+> **Opt-in, not in the default sweep**, for the same reason as
+> `currentuser_servlet`: its `@register` decorator was commented out while the
+> README still claimed it. Run it with `--handler reports`.
 
 **Why it exists**
 The reporting endpoints under `/libs/granite/content/reports` and the classic

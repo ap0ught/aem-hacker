@@ -112,6 +112,13 @@ aem_hacker.py -u https://aem.webapp --format json --output findings.json || echo
 (The usage block above is abridged for readability — `aem_hacker.py -h` is
 authoritative.)
 
+**Behaviour changes on this branch** (relative to `master`): exit status is now
+`0` clean / `1` found / `2` incomplete / `3` could-not-scan; `--delay N` now means
+`N` rather than `2N`; and roughly half as many HTTP requests are sent, because a
+warm-up request per URL and a fresh TLS handshake per request are gone. No check
+was added to or removed from the default sweep — see
+[opt-in checks](#opt-in-checks) below.
+
 **Authenticated checks (`--creds`).** Most AEM CVEs are low-privilege or
 require user interaction, so an anonymous scanner structurally cannot detect
 them — APSB22-59 alone lists ~35 such issues. Pass a credential and the checks
@@ -145,6 +152,12 @@ behaves exactly as before. Only the first
 credential is used for session-style probes, so supplying more does not multiply
 the request count; the default-credential checks try all of them in place of
 their built-in list.
+
+**Opt-in checks.** `currentuser_servlet` and `reports` are reachable but not part
+of a plain run — the maintainer deliberately took both out of the default sweep
+(see [CVE_COVERAGE.md](CVE_COVERAGE.md#-provenance-and-audit-status)). A plain run
+prints what it left out; run one explicitly with `--handler currentuser_servlet`
+or `--handler reports`.
 
 **Experimental checks.** Five of the checks carry CVE numbers that an audit
 found to be wrong: CVE-2023-38205 is an Adobe *ColdFusion* issue, CVE-2021-40722
